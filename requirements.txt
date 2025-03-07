@@ -4,10 +4,13 @@ requests
 lxml
 black
 rich
-shutil
 httpx
-pandas_ta
+git+https://github.com/twopirllc/pandas-ta.git@development
 APScheduler
-time
 psycopg2-binary
 dotenv
+textblob
+scipy
+notebook
+matplotlib
+seaborn

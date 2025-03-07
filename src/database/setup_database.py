@@ -42,6 +42,26 @@ def connect_db():
         return None
 
 
+def update_stock_info_table(cursor):
+    """Adds missing columns to the stock_info table if they do not exist."""
+    console.print(
+        "[bold yellow]🔄 Checking and updating stock_info table...[/bold yellow]"
+    )
+
+    alter_queries = [
+        "ALTER TABLE stock_info ADD COLUMN IF NOT EXISTS market_cap BIGINT;",
+        "ALTER TABLE stock_info ADD COLUMN IF NOT EXISTS pe_ratio NUMERIC;",
+        "ALTER TABLE stock_info ADD COLUMN IF NOT EXISTS eps NUMERIC;",
+        "ALTER TABLE stock_info ADD COLUMN IF NOT EXISTS earnings_date DATE;",
+    ]
+
+    for query in alter_queries:
+        cursor.execute(query)
+
+    console.print("[bold green]✅ stock_info table updated successfully![/bold green]")
+    logging.info("Updated stock_info table to include missing columns.")
+
+
 def create_tables():
     """Creates necessary tables including stock_info for sector filtering."""
     conn = connect_db()
@@ -50,6 +70,7 @@ def create_tables():
 
     with conn.cursor() as cur:
         try:
+            update_stock_info_table(cur)
             # Create stocks table (OHLCV data)
             cur.execute(
                 """
@@ -97,7 +118,25 @@ def create_tables():
                 CREATE TABLE IF NOT EXISTS stock_info (
                     ticker VARCHAR(10) PRIMARY KEY,
                     company_name TEXT,
-                    sector TEXT
+                    sector TEXT,
+                    market_cap BIGINT,
+                    pe_ratio NUMERIC,
+                    eps NUMERIC,
+                    earnings_date DATE
+                );
+            """
+            )
+
+            # Create news_sentiment table
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS news_sentiment (
+                    id SERIAL PRIMARY KEY,
+                    ticker VARCHAR(10) NOT NULL,
+                    published_at TIMESTAMP NOT NULL,
+                    title TEXT,
+                    sentiment_score NUMERIC,
+                    UNIQUE (ticker, published_at)
                 );
             """
             )
