@@ -5,3 +5,9 @@ lxml
 black
 rich
 shutil
+httpx
+pandas_ta
+APScheduler
+time
+psycopg2-binary
+dotenv
