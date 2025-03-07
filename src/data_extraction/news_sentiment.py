@@ -2,6 +2,7 @@ import os
 import requests
 import psycopg2
 import logging
+import time
 from dotenv import load_dotenv
 from textblob import TextBlob
 from rich.console import Console
@@ -26,46 +27,46 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 
-# API Configuration (Replace with actual API Key)
+# API Configuration
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 NEWS_API_URL = "https://newsapi.org/v2/everything"
 
 
-def connect_db():
-    """Connects to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-        return conn
-    except Exception as e:
-        console.print(f"[bold red]❌ Database connection error:[/bold red] {e}")
-        logging.error(f"Database connection error: {e}")
-        return None
-
-
-def fetch_stock_news(ticker):
-    """Fetches recent news articles related to a stock ticker."""
+def fetch_stock_news(ticker, max_retries=3):
+    """Fetches recent news articles for a stock ticker, handling rate limits."""
     params = {
         "q": ticker,
         "apiKey": NEWS_API_KEY,
         "language": "en",
         "sortBy": "publishedAt",
-        "pageSize": 5,  # Get the latest 5 articles
+        "pageSize": 5,  # Get latest 5 articles
     }
 
-    try:
-        response = requests.get(NEWS_API_URL, params=params)
-        response.raise_for_status()
-        return response.json().get("articles", [])
+    retries = 0
+    while retries < max_retries:
+        try:
+            response = requests.get(NEWS_API_URL, params=params)
 
-    except Exception as e:
-        logging.error(f"Failed to fetch news for {ticker}: {e}")
-        return []
+            # Handle rate limiting (429 Too Many Requests)
+            if response.status_code == 429:
+                wait_time = int(
+                    response.headers.get("Retry-After", 5)
+                )  # Default wait time = 5s
+                logging.warning(
+                    f"Rate limit exceeded for {ticker}. Retrying in {wait_time}s..."
+                )
+                time.sleep(wait_time)  # Wait before retrying
+                retries += 1
+                continue  # Retry request
+
+            response.raise_for_status()
+            return response.json().get("articles", [])
+
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to fetch news for {ticker}: {e}")
+            return []
+
+    return []  # Return empty if retries fail
 
 
 def analyze_sentiment(text):
@@ -99,12 +100,11 @@ def store_sentiment_data(cursor, ticker, articles):
 
 def process_news_sentiment():
     """Fetches news articles, analyzes sentiment, and stores results."""
-    conn = connect_db()
-    if not conn:
-        return
+    conn = psycopg2.connect(
+        dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
+    )
     cursor = conn.cursor()
 
-    # Fetch stock tickers from the database
     cursor.execute("SELECT DISTINCT ticker FROM stocks;")
     tickers = [row[0] for row in cursor.fetchall()]
 
@@ -122,6 +122,7 @@ def process_news_sentiment():
                 conn.commit()
                 logging.info(f"Stored news sentiment for {ticker}")
 
+            time.sleep(1)  # ✅ Add delay between API requests to avoid rate limiting
             progress.update(task, advance=1)
 
     cursor.close()
