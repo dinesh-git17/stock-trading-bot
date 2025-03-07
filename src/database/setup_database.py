@@ -70,7 +70,6 @@ def create_tables():
 
     with conn.cursor() as cur:
         try:
-            update_stock_info_table(cur)
             # Create stocks table (OHLCV data)
             cur.execute(
                 """
@@ -141,6 +140,7 @@ def create_tables():
             """
             )
 
+            update_stock_info_table(cur)
             console.print(
                 "[bold green]✅ Database tables created successfully![/bold green]"
             )
