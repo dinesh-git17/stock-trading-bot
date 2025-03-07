@@ -1,0 +1,7 @@
+yfinance
+pandas
+requests
+lxml
+black
+rich
+shutil
