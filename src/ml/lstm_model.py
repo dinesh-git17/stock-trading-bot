@@ -1,224 +1,227 @@
 import numpy as np
 import pandas as pd
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
-from dotenv import load_dotenv
 import os
 import logging
-from rich.console import Console
+import warnings
 import tensorflow as tf
-import psycopg2
-from rich.progress import Progress
-from tensorflow.keras.layers import Input
-from rich.progress import Progress, BarColumn, TextColumn
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from dotenv import load_dotenv
+from rich.console import Console
+from rich.table import Table
+from multiprocessing import Pool, cpu_count, Manager, set_start_method
+import signal
+import sys
+
+# ✅ Fix multiprocessing issue on macOS
+if sys.platform == "darwin":
+    set_start_method("fork")
 
 # Load environment variables
 load_dotenv()
 
 # Setup logging
 logging.basicConfig(
-    filename="data/logs/lstm_model.log",
+    filename="data/logs/lstm_training.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 console = Console()
 
-# Database connection configuration
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
+# Suppress warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# TensorFlow Suppression
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Hide TensorFlow logs
+
+# Directory Paths
+PROCESSED_DATA_PATH = "data/processed_data/"
+MODEL_PATH = "models/"
+os.makedirs(MODEL_PATH, exist_ok=True)  # ✅ Ensure model directory exists
+
+# LSTM Configuration
+SEQUENCE_LENGTH = 60
+BATCH_SIZE = 32
+EPOCHS = 50
+
+# ✅ Use Manager() to share results & skipped tickers across processes
+manager = Manager()
+results = manager.list()
+skipped_tickers = manager.list()
+processed_tickers = manager.list()  # ✅ Track processed tickers to prevent duplicates
 
 
-# Database connection function
-def connect_db():
-    """Connects to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-        return conn
-    except Exception as e:
-        console.print(f"[bold red]❌ Database connection error:[/bold red] {e}")
-        logging.error(f"Database connection error: {e}")
-        return None
+# Handle Ctrl+C to exit safely
+def signal_handler(sig, frame):
+    console.print(
+        "\n[bold red]❌ Process interrupted. Exiting safely...[/bold red]",
+        justify="center",
+    )
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+
+def count_saved_models():
+    """Counts and logs the total number of models saved."""
+    num_models = len([f for f in os.listdir(MODEL_PATH) if f.endswith(".h5")])
+    console.print(f"[bold cyan]📊 Total models saved: {num_models}[/bold cyan]")
+    return num_models
 
 
 def load_data(ticker):
-    """Loads preprocessed stock data."""
-    file_path = f"data/processed_data/{ticker}_processed.csv"
-    if not os.path.exists(file_path):
-        logging.warning(f"Processed data file for {ticker} does not exist!")
-        return None
+    """Loads preprocessed training and testing data for a given ticker."""
+    train_file = os.path.join(PROCESSED_DATA_PATH, f"{ticker}_train.csv")
+    test_file = os.path.join(PROCESSED_DATA_PATH, f"{ticker}_test.csv")
 
-    df = pd.read_csv(file_path)
-    return df
+    if not os.path.exists(train_file) or not os.path.exists(test_file):
+        logging.warning(f"No data found for {ticker}. Skipping training.")
+        skipped_tickers.append((ticker, "No Data"))
+        return None, None
+
+    df_train = pd.read_csv(train_file)
+    df_test = pd.read_csv(test_file)
+
+    return df_train, df_test
 
 
-def prepare_data(df, ticker, sequence_length=60):
-    """Prepares the data for LSTM model."""
-    # Drop the 'date' column as it's not needed for the model
-    df = df.drop(columns=["date"])
+def prepare_data(df_train, df_test, ticker):
+    """Prepares data for LSTM model (reshapes into 3D format)."""
+    df_train = df_train.drop(columns=["date"], errors="ignore")
+    df_test = df_test.drop(columns=["date"], errors="ignore")
 
-    # Use MinMaxScaler only on the 'close' column (or the column you're predicting)
-    scaler = MinMaxScaler(feature_range=(0, 1))
+    # Ensure only numeric columns remain
+    feature_columns = df_train.select_dtypes(include=[np.number]).columns.tolist()
 
-    # Only scale the 'close' column (assuming you're predicting close prices)
-    close_data = df[["close"]]  # Extract 'close' column
-    scaled_data = scaler.fit_transform(close_data.values)
+    # Scale only numeric columns
+    scaler = MinMaxScaler()
+    df_train[feature_columns] = scaler.fit_transform(df_train[feature_columns])
+    df_test[feature_columns] = scaler.transform(df_test[feature_columns])
 
-    # Check if the dataset has enough data
-    if len(scaled_data) < sequence_length:
-        logging.warning(
-            f"Dataset for {ticker} is too small with only {len(scaled_data)} rows. Skipping this ticker."
-        )
-        return None  # Skip this ticker
+    def create_sequences(data):
+        """Creates LSTM-compatible sequences."""
+        X, y = [], []
+        for i in range(SEQUENCE_LENGTH, len(data)):
+            X.append(data[i - SEQUENCE_LENGTH : i, :])  # Past 60 days as input
+            y.append(
+                data[i, feature_columns.index("close")]
+            )  # Get the index of 'close' column
 
-    # Prepare the sequences for LSTM
-    X, y = [], []
-    for i in range(sequence_length, len(scaled_data)):
-        X.append(
-            scaled_data[i - sequence_length : i, 0]
-        )  # Last `sequence_length` closing prices
-        y.append(scaled_data[i, 0])  # Next day's closing price
+        return np.array(X), np.array(y).reshape(
+            -1, 1
+        )  # Reshape y for LSTM compatibility
 
-    # If there are no sequences created, return an error or empty list
-    if len(X) == 0:
-        raise ValueError(
-            "Not enough data to create sequences. Please ensure your dataset is sufficiently large."
-        )
+    X_train, y_train = create_sequences(df_train[feature_columns].values)
+    X_test, y_test = create_sequences(df_test[feature_columns].values)
 
-    # Convert to numpy arrays
-    X = np.array(X)
-    y = np.array(y)
-
-    # Ensure X has the correct shape for LSTM (samples, time_steps, features)
-    if X.ndim == 2:
-        X = np.reshape(
-            X, (X.shape[0], X.shape[1], 1)
-        )  # Reshaping to 3D for LSTM input (samples, time_steps, features)
-
-    return X, y, scaler
+    return X_train, y_train, X_test, y_test, scaler, feature_columns
 
 
 def build_lstm_model(input_shape):
-    """Builds the LSTM model."""
-    model = Sequential()
+    """Builds and compiles an optimized LSTM model."""
+    model = Sequential(
+        [
+            LSTM(units=64, return_sequences=True, input_shape=input_shape),
+            Dropout(0.2),
+            LSTM(units=64, return_sequences=False),
+            Dropout(0.2),
+            Dense(units=1),
+        ]
+    )
 
-    # Add Input layer as the first layer
-    model.add(Input(shape=input_shape))
-
-    # First LSTM layer with 50 units
-    model.add(LSTM(units=50, return_sequences=True))
-    model.add(Dropout(0.2))
-
-    # Second LSTM layer
-    model.add(LSTM(units=50, return_sequences=False))
-    model.add(Dropout(0.2))
-
-    # Output layer
-    model.add(Dense(units=1))  # Output layer
-
-    # Compile the model
     model.compile(optimizer="adam", loss="mean_squared_error")
     return model
 
 
 def train_model(ticker):
-    """Trains the LSTM model."""
-    console.print(f"\n[bold blue]Training model for {ticker}...[/bold blue]")
-
-    # Load the preprocessed data
-    df = load_data(ticker)
-    if df is None:
+    """Loads data, trains LSTM model, and saves best model."""
+    if ticker in processed_tickers:
+        console.print(
+            f"[bold blue]{ticker:<6} 🔄 Skipping duplicate training.[/bold blue]"
+        )
         return
 
-    # Prepare the data for LSTM
-    result = prepare_data(df, ticker)  # Pass the ticker to prepare_data
-    if result is None:
-        logging.warning(f"Skipping {ticker} due to insufficient data.")
-        return  # Skip this ticker if the data preparation failed
+    console.print(f"[bold yellow]{ticker:<6} ⏳ Training model...[/bold yellow]")
 
-    X, y, scaler = result
+    try:
+        df_train, df_test = load_data(ticker)
+        if df_train is None or df_test is None:
+            return
 
-    # Split the data into training and testing
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=False
+        X_train, y_train, X_test, y_test, scaler, feature_columns = prepare_data(
+            df_train, df_test, ticker
+        )
+
+        if len(X_train) == 0 or len(X_test) == 0:
+            skipped_tickers.append((ticker, "Insufficient Data"))
+            return
+
+        model = build_lstm_model((SEQUENCE_LENGTH, X_train.shape[2]))
+
+        # ✅ Ensure model file path
+        model_checkpoint_path = os.path.join(MODEL_PATH, f"lstm_{ticker}.h5")
+
+        # Callbacks for early stopping & saving best model
+        model_checkpoint = ModelCheckpoint(
+            model_checkpoint_path,
+            save_best_only=True,
+            monitor="val_loss",
+            mode="min",
+            verbose=0,
+        )
+        early_stopping = EarlyStopping(
+            monitor="val_loss", patience=5, restore_best_weights=True, verbose=0
+        )
+
+        model.fit(
+            X_train,
+            y_train,
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            validation_data=(X_test, y_test),
+            verbose=0,
+            callbacks=[early_stopping],
+        )
+
+        # ✅ Save model at the end
+        model.save(model_checkpoint_path)
+        processed_tickers.append(ticker)  # ✅ Mark as processed
+
+        console.print(f"[bold green]{ticker:<6} ✅ Model trained & saved.[/bold green]")
+
+    except Exception as e:
+        console.print(f"[bold red]{ticker:<6} ❌ Training failed: {e}[/bold red]")
+        skipped_tickers.append((ticker, "Training Failed"))
+
+
+def process_all_models():
+    """Processes all tickers using parallel processing."""
+    tickers = [
+        f.split("_")[0]
+        for f in os.listdir(PROCESSED_DATA_PATH)
+        if f.endswith("_train.csv")
+    ]
+
+    console.print(
+        f"[bold cyan]🚀 Training LSTM models for {len(tickers)} tickers in parallel...[/bold cyan]",
+        justify="left",
     )
 
-    # Build and train the LSTM model
-    model = build_lstm_model((X_train.shape[1], 1))
+    with Pool(cpu_count()) as pool:
+        pool.map(train_model, tickers)
 
-    with Progress(
-        TextColumn("[bold yellow]Epoch:[bold yellow] {task.completed} / {task.total}"),
-        BarColumn(),
-        console=console,
-    ) as progress:
-        # Add a task to track progress for training epochs
-        task = progress.add_task(f"Training {ticker}", total=10)
+    console.print(
+        "[bold green]✅ All LSTM model training complete![/bold green]", justify="left"
+    )
 
-        # Training the model and updating progress
-        for epoch in range(10):
-            model.fit(
-                X_train,
-                y_train,
-                epochs=1,
-                batch_size=32,
-                validation_data=(X_test, y_test),
-                verbose=0,
-            )
-            progress.update(task, advance=1)
-            console.print(
-                f"[bold green]Epoch {epoch + 1} completed for {ticker}[/bold green]"
-            )
+    # ✅ Count and log total saved models
+    count_saved_models()
 
-    # Save the trained model
-    model.save(f"models/lstm_model_{ticker}.h5")
-    logging.info(f"Trained LSTM model for {ticker} saved successfully.")
-
-    # Evaluate the model performance
-    predictions = model.predict(X_test)
-    predictions = scaler.inverse_transform(
-        predictions
-    )  # Rescale back to original values
-    y_test_rescaled = scaler.inverse_transform(
-        y_test.reshape(-1, 1)
-    )  # Rescale back to original values
-
-    # Calculate RMSE (Root Mean Squared Error) for evaluation
-    rmse = np.sqrt(np.mean(np.square(predictions - y_test_rescaled)))
-    logging.info(f"RMSE for {ticker} model: {rmse}")
-
-    # Display a clean result in the console
-    console.print(f"[bold blue]Model trained and saved for {ticker}![/bold blue]")
-
-
-def get_tickers_from_db():
-    """Fetch all tickers from the database."""
-    conn = connect_db()
-    if not conn:
-        return []
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT DISTINCT ticker FROM stocks;")
-    tickers = [row[0] for row in cursor.fetchall()]
-    conn.close()
-
-    return tickers
-
-# Main loop to process all tickers
-def train_all_models():
-    tickers = ["AAPL", "TSLA", "GOOGL", "AMCR", "PLTR", "WMT"]  # Example tickers, could be fetched from DB
-    for ticker in tickers:
-        train_model(ticker)
 
 if __name__ == "__main__":
-    train_all_models()
+    process_all_models()
