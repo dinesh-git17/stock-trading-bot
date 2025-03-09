@@ -3,6 +3,7 @@ import requests
 import psycopg2
 import logging
 import time
+import sys
 from dotenv import load_dotenv
 from textblob import TextBlob
 from rich.console import Console
@@ -51,7 +52,7 @@ def fetch_stock_news(ticker, max_retries=3):
             if response.status_code == 429:
                 wait_time = int(
                     response.headers.get("Retry-After", 5)
-                )  # Default wait time = 5s
+                )  # Default wait = 5s
                 logging.warning(
                     f"Rate limit exceeded for {ticker}. Retrying in {wait_time}s..."
                 )
@@ -66,6 +67,7 @@ def fetch_stock_news(ticker, max_retries=3):
             logging.error(f"Failed to fetch news for {ticker}: {e}")
             return []
 
+    logging.error(f"Max retries reached for {ticker}. Skipping...")
     return []  # Return empty if retries fail
 
 
@@ -125,9 +127,26 @@ def process_news_sentiment():
             time.sleep(1)  # ✅ Add delay between API requests to avoid rate limiting
             progress.update(task, advance=1)
 
+            # Check if the last fetch resulted in a rate limit
+            if (
+                not articles
+                and "Rate limit exceeded" in open("data/logs/news_sentiment.log").read()
+            ):
+                console.print(
+                    "[bold red]❌ API Rate Limit exceeded. Storing available data and exiting...[/bold red]"
+                )
+                logging.error(
+                    "API Rate Limit exceeded. Exiting safely while storing available data."
+                )
+                break  # Stop processing further tickers
+
+    conn.commit()
     cursor.close()
     conn.close()
-    console.print("[bold green]✅ News sentiment analysis completed![/bold green]")
+    console.print(
+        "[bold green]✅ News sentiment analysis completed with available data![/bold green]"
+    )
+    sys.exit(0)  # Exit safely
 
 
 if __name__ == "__main__":
