@@ -61,6 +61,52 @@ def update_stock_info_table(cursor):
     console.print("[bold green]✅ stock_info table updated successfully![/bold green]")
     logging.info("Updated stock_info table to include missing columns.")
 
+def update_technical_indicators_table(cursor):
+    """Ensures technical_indicators table matches the expected schema."""
+    console.print("[bold yellow]🔄 Checking and updating technical_indicators table...[/bold yellow]")
+
+    # Define the correct schema
+    required_columns = {
+        "id": "SERIAL PRIMARY KEY",
+        "ticker": "VARCHAR(10) NOT NULL",
+        "date": "TIMESTAMP NOT NULL",
+        "sma_20": "NUMERIC",
+        "ema_20": "NUMERIC",
+        "rsi_14": "NUMERIC",
+        "macd": "NUMERIC",
+        "macd_signal": "NUMERIC",
+        "macd_hist": "NUMERIC",
+        "bb_upper": "NUMERIC",
+        "bb_middle": "NUMERIC",
+        "bb_lower": "NUMERIC",
+    }
+
+    # Fetch current columns
+    cursor.execute(
+        """
+        SELECT column_name FROM information_schema.columns 
+        WHERE table_name = 'technical_indicators';
+        """
+    )
+    existing_columns = {row[0] for row in cursor.fetchall()}
+
+    # Add missing columns
+    for column, column_type in required_columns.items():
+        if column not in existing_columns:
+            cursor.execute(f"ALTER TABLE technical_indicators ADD COLUMN {column} {column_type};")
+            console.print(f"[bold green]➕ Added column:[/bold green] {column}")
+
+    # Remove extra columns
+    for column in existing_columns:
+        if column not in required_columns:
+            cursor.execute(f"ALTER TABLE technical_indicators DROP COLUMN {column} CASCADE;")
+            console.print(f"[bold red]❌ Removed extra column:[/bold red] {column}")
+
+    console.print("[bold green]✅ technical_indicators table is up to date![/bold green]")
+    logging.info("Technical indicators table updated successfully.")
+
+
+
 
 def create_tables():
     """Creates necessary tables including stock_info for sector filtering."""
@@ -141,6 +187,7 @@ def create_tables():
             )
 
             update_stock_info_table(cur)
+            update_technical_indicators_table(cur)
             console.print(
                 "[bold green]✅ Database tables created successfully![/bold green]"
             )
