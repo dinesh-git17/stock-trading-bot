@@ -1,7 +1,8 @@
-import os
-import psycopg2
-import pandas as pd
 import logging
+import os
+
+import pandas as pd
+import psycopg2
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn

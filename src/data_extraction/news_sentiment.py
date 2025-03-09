@@ -1,16 +1,18 @@
-import os
-import requests
-import psycopg2
 import logging
-import time
+import os
 import sys
+import time
+
+import psycopg2
+import requests
 from dotenv import load_dotenv
-from textblob import TextBlob
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from textblob import TextBlob
 
 # Load environment variables
 load_dotenv()
+
 
 # Setup logging
 logging.basicConfig(

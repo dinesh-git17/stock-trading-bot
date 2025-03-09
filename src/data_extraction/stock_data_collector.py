@@ -1,13 +1,15 @@
-import yfinance as yf
+import concurrent.futures
+import logging
+from io import StringIO
+from time import sleep
+
 import pandas as pd
 import requests
-import logging
-import shutil
-from io import StringIO
-from rich.console import Console
-from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
+import yfinance as yf
 from rich.columns import Columns
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 
 # Setup logging
 logging.basicConfig(
@@ -22,19 +24,20 @@ YAHOO_MOST_ACTIVE_URL = "https://finance.yahoo.com/markets/stocks/most-active"
 
 def fetch_most_active_stocks(limit=100):
     """
-    Fetch at least 'limit' most active stocks from Yahoo Finance by iterating pages.
+    Fetch at least 'limit' most active stocks from Yahoo Finance.
+    Uses pagination to retrieve data efficiently.
     Returns a list of valid stock tickers along with company names.
     """
-    all_stocks = []
-    start = 0  # Pagination starts at 0
+    all_stocks = set()  # Use a set to avoid duplicates
+    start = 0  # Pagination start
 
-    console.print("\n")  # Add vertical space
+    console.print("\n")
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold yellow]Fetching most active stocks...[/bold yellow]"),
         console=console,
     ) as progress:
-        task = progress.add_task("fetching", total=None)  # Indeterminate progress bar
+        task = progress.add_task("Fetching stocks", total=None)
 
         try:
             while len(all_stocks) < limit:
@@ -42,44 +45,39 @@ def fetch_most_active_stocks(limit=100):
                 response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
                 response.raise_for_status()
 
-                # Read the table using StringIO
-                tables = pd.read_html(StringIO(response.text))
+                # Read the table efficiently using lxml
+                tables = pd.read_html(StringIO(response.text), flavor="lxml")
 
-                if len(tables) == 0:
+                if not tables:
                     console.print(
                         "\n[bold red]No more data available from Yahoo![/bold red]\n"
                     )
-                    break  # No more data to fetch
+                    break
 
                 data = tables[0][["Symbol", "Name"]]
-                stocks = [
+                stocks = {
                     (row["Symbol"].upper(), row["Name"]) for _, row in data.iterrows()
-                ]
+                }
 
-                all_stocks.extend(stocks)
-                start += 25  # Move to the next page
+                all_stocks.update(stocks)
+                start += 25  # Move to next batch
 
-                # Stop if Yahoo returns fewer than 25 stocks (end of data)
+                # Stop if fewer than 25 new stocks were found (end of data)
                 if len(stocks) < 25:
                     break
 
-            # Ensure we have exactly 'limit' stocks
-            all_stocks = list(dict.fromkeys(all_stocks))[
-                :limit
-            ]  # Remove duplicates, keep order
+            # Convert set to a list and keep only 'limit' stocks
+            all_stocks = list(all_stocks)[:limit]
 
-            # Validate tickers
-            valid_stocks = validate_stocks(all_stocks)
+            # Validate tickers in parallel
+            valid_stocks = validate_stocks_parallel(all_stocks)
 
-            # Mark progress as done
             progress.update(task, advance=1, completed=1, visible=False)
             console.print(
-                "[bold green]✅ Done fetching most active stocks![/bold green]\n"
+                f"[bold green]✅ {len(valid_stocks)} valid stocks fetched![/bold green]\n"
             )
 
-            # Log successful fetch
             logging.info(f"Fetched {len(valid_stocks)} most active stocks.")
-
             return valid_stocks
 
         except Exception as e:
@@ -88,36 +86,54 @@ def fetch_most_active_stocks(limit=100):
             return []
 
 
-def validate_stocks(stocks):
+def validate_stock(ticker, name):
     """
-    Validate stock tickers by checking if data exists in Yahoo Finance.
+    Validate stock tickers by checking if Yahoo Finance has valid market data.
+    Uses a retry mechanism for reliability.
+    Returns the ticker and name if valid, otherwise None.
+    """
+    stock = yf.Ticker(ticker)
+    retries = 3
+    for attempt in range(retries):
+        try:
+            # Check multiple possible sources for price data
+            last_price = stock.fast_info.get("last_price")
+            if last_price is None:
+                last_price = stock.history(period="1d").get("Close")
+                if last_price is not None and not last_price.empty:
+                    last_price = last_price.iloc[-1]
+
+            if last_price is not None:
+                return ticker, name
+        except Exception as e:
+            logging.warning(f"Retry {attempt + 1}/{retries} for {ticker}: {e}")
+            sleep(2)  # Wait before retrying
+
+    return None  # If all retries fail, consider invalid
+
+
+def validate_stocks_parallel(stocks):
+    """
+    Validate stock tickers in parallel using ThreadPoolExecutor.
     """
     valid_stocks = []
-    for ticker, name in stocks:
-        stock = yf.Ticker(ticker)
-        try:
-            if "regularMarketPrice" in stock.info:
-                valid_stocks.append((ticker, name))
-        except:
-            pass  # Ignore invalid tickers
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        results = executor.map(lambda s: validate_stock(*s), stocks)
+
+    # Filter out None values
+    valid_stocks = [res for res in results if res is not None]
 
     return valid_stocks
 
 
 def display_stocks(stocks):
     """
-    Display fetched stock tickers & company names in multiple Rich tables side by side.
+    Display fetched stock tickers & company names using dynamically formatted tables.
     """
-    terminal_size = shutil.get_terminal_size((100, 20))  # Default to (100, 20) if None
-    terminal_width = (
-        terminal_size.columns if terminal_size else 100
-    )  # Fix for NoneType error
 
-    num_tables = max(2, terminal_width // 40)  # Determine number of side-by-side tables
-    stocks_per_table = 25  # Rows per table
+    stocks_per_table = 25
     tables = []
 
-    # Create tables with 25 stocks each
     for i in range(0, len(stocks), stocks_per_table):
         table = Table(
             title=f"Stocks {i+1}-{min(i+stocks_per_table, len(stocks))}",
@@ -131,7 +147,6 @@ def display_stocks(stocks):
 
         tables.append(table)
 
-    # Display tables side by side
     console.print("\n")
     console.print(Columns(tables, expand=True))
     console.print("\n")
@@ -139,4 +154,5 @@ def display_stocks(stocks):
 
 if __name__ == "__main__":
     most_active_stocks = fetch_most_active_stocks()
-    display_stocks(most_active_stocks)  # ✅ Fix: Removed () after most_active_stocks
+    if most_active_stocks:
+        display_stocks(most_active_stocks)

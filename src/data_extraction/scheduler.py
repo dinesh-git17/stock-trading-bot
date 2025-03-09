@@ -1,10 +1,11 @@
+import logging
+import time
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-import time
-import logging
+from ohlc_data_retriever import fetch_ohlc_data
 from rich.console import Console
 from stock_data_collector import fetch_most_active_stocks
-from ohlc_data_retriever import fetch_ohlc_data
 from technical_indicators import process_all_stocks
 
 # Setup logging

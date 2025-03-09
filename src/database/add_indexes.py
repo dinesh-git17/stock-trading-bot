@@ -1,6 +1,7 @@
-import os
-import psycopg2
 import logging
+import os
+
+import psycopg2
 from dotenv import load_dotenv
 from rich.console import Console
 
@@ -15,6 +16,7 @@ logging.basicConfig(
 )
 
 console = Console()
+
 
 # Database Configuration
 DB_NAME = os.getenv("DB_NAME")

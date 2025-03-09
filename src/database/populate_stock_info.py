@@ -1,7 +1,8 @@
+import logging
 import os
+
 import psycopg2
 import yfinance as yf
-import logging
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn

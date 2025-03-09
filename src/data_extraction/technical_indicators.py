@@ -1,7 +1,8 @@
+import logging
+import os
+
 import pandas as pd
 import pandas_ta as ta
-import os
-import logging
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 

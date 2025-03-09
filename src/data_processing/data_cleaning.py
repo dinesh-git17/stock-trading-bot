@@ -1,10 +1,10 @@
-import pandas as pd
-import numpy as np
-import os
 import logging
-from scipy.stats import zscore
+import os
+
+import pandas as pd
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from scipy.stats import zscore
 
 # Setup logging
 logging.basicConfig(

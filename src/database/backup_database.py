@@ -1,7 +1,8 @@
+import logging
 import os
 import subprocess
-import logging
 from datetime import datetime
+
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn

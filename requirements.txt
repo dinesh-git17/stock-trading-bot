@@ -16,3 +16,4 @@ matplotlib
 seaborn
 scikit-learn
 tensorflow
+xgboost
