@@ -1,12 +1,15 @@
-import pandas as pd
-import os
 import logging
+import os
 import warnings
+from multiprocessing import Pool, cpu_count
+
+import pandas as pd
+from alive_progress import alive_bar
 from dotenv import load_dotenv
 from rich.console import Console
-from sklearn.preprocessing import MinMaxScaler
+from rich.table import Table
 from sklearn.model_selection import train_test_split
-from multiprocessing import Pool, cpu_count
+from sklearn.preprocessing import MinMaxScaler
 
 # Load environment variables
 load_dotenv()
@@ -41,9 +44,10 @@ def load_data(ticker):
 
 def handle_missing_data(df):
     """Handles missing values using forward fill and backward fill."""
-    df = df.ffill().bfill()
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
     df.dropna(inplace=True)  # Drop rows if any NaNs remain
-    return df if not df.empty else None  # Return None if empty
+    return df if not df.empty else None
 
 
 def feature_engineering(df):
@@ -64,11 +68,11 @@ def feature_engineering(df):
         df[f"close_lag_{lag}"] = df["close"].shift(lag)
 
     df.dropna(inplace=True)
-    return df if not df.empty else None  # Return None if empty
+    return df if not df.empty else None
 
 
 def scale_data(df):
-    """Scales numerical features using MinMaxScaler, ensuring non-empty data."""
+    """Scales numerical features using MinMaxScaler."""
     feature_columns = [
         "open",
         "high",
@@ -94,7 +98,7 @@ def scale_data(df):
 
     if df.empty or len(df) < 1:
         logging.warning("Skipping MinMaxScaler - No valid data available.")
-        return None  # Skip if no valid data
+        return None
 
     scaler = MinMaxScaler()
     df[feature_columns] = scaler.fit_transform(df[feature_columns])
@@ -103,59 +107,43 @@ def scale_data(df):
 
 
 def train_test_split_data(df, ticker):
-    """Splits the data into train-test sets and saves them, ensuring non-empty data."""
+    """Splits the data into train-test sets and saves them."""
     if df is None or df.empty:
         logging.warning(f"Skipping {ticker} - No data after preprocessing.")
-        console.print(f"[bold red]⚠ Skipping {ticker} - No valid data.[/bold red]")
         return
 
     train, test = train_test_split(df, test_size=0.2, shuffle=False)
 
-    train_file = os.path.join(PROCESSED_DATA_PATH, f"{ticker}_train.csv")
-    test_file = os.path.join(PROCESSED_DATA_PATH, f"{ticker}_test.csv")
-
-    train.to_csv(train_file, index=False)
-    test.to_csv(test_file, index=False)
+    train.to_csv(os.path.join(PROCESSED_DATA_PATH, f"{ticker}_train.csv"), index=False)
+    test.to_csv(os.path.join(PROCESSED_DATA_PATH, f"{ticker}_test.csv"), index=False)
 
     logging.info(f"Saved train-test data for {ticker}")
-    console.print(f"[bold green]✅ Processed & saved: {ticker}[/bold green]")
 
 
 def process_ticker(ticker):
     """Processes a single ticker: loads, cleans, engineers features, scales, and splits data."""
-    console.print(f"[bold yellow]⏳ Processing {ticker}...[/bold yellow]")
-
     df = load_data(ticker)
     if df is None:
-        console.print(f"[bold red]⚠ No data for {ticker}. Skipping.[/bold red]")
-        return
+        return f"⚠ No data for {ticker}, Skipping."
 
     df = handle_missing_data(df)
     if df is None:
-        console.print(
-            f"[bold red]⚠ {ticker} has no valid data after missing value handling. Skipping.[/bold red]"
-        )
-        return
+        return f"⚠ {ticker} empty after missing data handling."
 
     df = feature_engineering(df)
     if df is None:
-        console.print(
-            f"[bold red]⚠ {ticker} has no valid data after feature engineering. Skipping.[/bold red]"
-        )
-        return
+        return f"⚠ {ticker} empty after feature engineering."
 
     df = scale_data(df)
     if df is None:
-        console.print(
-            f"[bold red]⚠ {ticker} has no valid data after scaling. Skipping.[/bold red]"
-        )
-        return
+        return f"⚠ {ticker} empty after scaling."
 
     train_test_split_data(df, ticker)
+    return f"✅ {ticker} processed & saved!"
 
 
 def process_all_data():
-    """Processes all tickers using parallel processing, ensuring only valid tickers are used."""
+    """Processes all tickers using parallel processing with a modern progress bar."""
     tickers = [
         f.split("_")[-1].replace(".csv", "")
         for f in os.listdir(TRAINING_DATA_PATH)
@@ -163,13 +151,27 @@ def process_all_data():
     ]
 
     console.print(
-        f"[bold cyan]🚀 Processing {len(tickers)} tickers in parallel using {cpu_count()} cores...[/bold cyan]"
+        f"[bold cyan]🚀 Processing {len(tickers)} tickers using {min(8, cpu_count())} cores...[/bold cyan]"
     )
 
-    with Pool(cpu_count()) as pool:
-        pool.map(process_ticker, tickers)
+    results = []
+    with Pool(min(8, cpu_count())) as pool, alive_bar(
+        len(tickers), title="Processing Tickers", bar="smooth"
+    ) as bar:
+        for res in pool.imap(process_ticker, tickers):
+            results.append(res)
+            bar()  # Update progress bar
 
-    console.print("[bold green]✅ All data preprocessing complete![/bold green]")
+    console.print("\n[bold green]✅ All data preprocessing complete![/bold green]\n")
+
+    # Display summary table
+    table = Table(title="Preprocessing Summary")
+    table.add_column("Status", justify="center", style="cyan", no_wrap=True)
+
+    for result in results:
+        table.add_row(result)
+
+    console.print(table)
 
 
 if __name__ == "__main__":

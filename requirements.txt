@@ -17,3 +17,5 @@ seaborn
 scikit-learn
 tensorflow
 xgboost
+alive-progress
+optuna

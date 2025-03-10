@@ -1,41 +1,42 @@
+import multiprocessing
 import os
+
+# ✅ Fix multiprocessing crash on macOS
+if multiprocessing.get_start_method(allow_none=True) is None:
+    multiprocessing.set_start_method("spawn", force=True)
+
+import logging
+import signal
+import sys
+import warnings
+from datetime import datetime
+from multiprocessing import Pool, cpu_count
+
+import joblib
 import numpy as np
 import pandas as pd
 import tensorflow as tf
-import logging
-import warnings
-import joblib
-from datetime import datetime
-from tensorflow.keras.models import load_model
-from tensorflow.keras.layers import (
-    MultiHeadAttention,
-    Conv1D,
-    LayerNormalization,
-    Dropout,
-    Dense,
-    Flatten,
-)
-from sklearn.metrics import mean_squared_error, mean_absolute_error  # ✅ FIXED IMPORT
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
-from multiprocessing import Pool, cpu_count
-import signal
-import sys
+from sklearn.metrics import mean_squared_error
+from tensorflow.keras.models import load_model
+from tqdm import tqdm
 
-# ✅ Fix multiprocessing issue on macOS
-if sys.platform == "darwin":
-    from multiprocessing import set_start_method
-
-    set_start_method("fork")
+# ✅ Suppress TensorFlow logs & Metal plugin logs
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = (
+    "0"  # Disable unnecessary TensorFlow optimizations
+)
+tf.get_logger().setLevel("ERROR")
 
 # ✅ Load environment variables
 load_dotenv()
 
-# ✅ Setup logging (logs both to file and console)
+# ✅ Setup logging
 LOG_FILE = "data/logs/compare_models.log"
 os.makedirs("data/logs", exist_ok=True)
-os.makedirs("data/comparisons", exist_ok=True)  # ✅ Create comparison folder
+os.makedirs("data/comparisons", exist_ok=True)
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -45,17 +46,13 @@ logging.basicConfig(
 
 console = Console()
 
-# ✅ Suppress warnings & TensorFlow logs
-warnings.filterwarnings("ignore", category=UserWarning)
-tf.get_logger().setLevel("ERROR")
-
 # ✅ Directory Paths
 PROCESSED_DATA_PATH = "data/processed_data/"
 MODEL_PATH = "models/"
 SCALER_PATH = "models/scalers/"
+SEQUENCE_LENGTH = 60
 
 
-# ✅ Handle Ctrl+C safely
 def signal_handler(sig, frame):
     console.print("\n[bold red]❌ Process interrupted. Exiting safely...[/bold red]")
     logging.info("Process interrupted by user.")
@@ -66,19 +63,23 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def load_test_data(ticker):
-    """Loads the test data and corresponding scaler for a given ticker."""
+    """Loads test data and scaler, ensuring feature consistency."""
     test_file = os.path.join(PROCESSED_DATA_PATH, f"{ticker}_test.csv")
     scaler_file = os.path.join(SCALER_PATH, f"{ticker}_scaler.pkl")
 
     if not os.path.exists(test_file) or not os.path.exists(scaler_file):
-        console.print(
-            f"[bold red]⚠ No test data or scaler found for {ticker}. Skipping...[/bold red]"
-        )
         logging.warning(f"{ticker} - No test data or scaler found. Skipping...")
         return None, None
 
     df_test = pd.read_csv(test_file).select_dtypes(include=[np.number])
     scaler = joblib.load(scaler_file)
+
+    # 🔥 Ensure test data has the same features as training
+    expected_features = scaler.feature_names_in_
+    for col in expected_features:
+        if col not in df_test.columns:
+            df_test[col] = 0  # Fill missing columns with 0s
+    df_test = df_test[expected_features]  # Ensure correct column order
 
     return df_test, scaler
 
@@ -87,9 +88,8 @@ def make_predictions(model, X_test, scaler, feature_columns):
     """Makes predictions and scales back to original values."""
     predictions = model.predict(
         X_test.astype(np.float32), verbose=0
-    )  # 🔥 Suppress TensorFlow logs
+    )  # ✅ Suppressed output
 
-    # ✅ Ensure correct shape before inverse transformation
     predictions_padded = np.hstack(
         [predictions] + [np.zeros_like(predictions)] * (len(feature_columns) - 1)
     )
@@ -101,13 +101,11 @@ def make_predictions(model, X_test, scaler, feature_columns):
 def evaluate_predictions(y_true, y_pred):
     """Computes RMSE."""
     mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
-    return rmse
+    return np.sqrt(mse)
 
 
 def compare_models(ticker):
     """Compares LSTM vs. StockGPT for a given ticker."""
-    console.print(f"[bold yellow]{ticker:<6} 🔍 Comparing models...[/bold yellow]")
     logging.info(f"{ticker} - Comparing models...")
 
     df_test, scaler = load_test_data(ticker)
@@ -121,33 +119,29 @@ def compare_models(ticker):
     stock_gpt_model_path = os.path.join(MODEL_PATH, f"stock_gpt_{ticker}.keras")
 
     if not os.path.exists(lstm_model_path) or not os.path.exists(stock_gpt_model_path):
-        console.print(
-            f"[bold red]⚠ Models not found for {ticker}. Skipping...[/bold red]"
-        )
         logging.warning(f"{ticker} - Models not found. Skipping...")
         return None
 
     # ✅ Load LSTM Model
-    lstm_model = load_model(lstm_model_path)
+    lstm_model = load_model(lstm_model_path, compile=False)
 
-    # ✅ Load StockGPT Model
+    # ✅ Load StockGPT Model (with error handling)
     try:
-        stock_gpt_model = tf.keras.models.load_model(stock_gpt_model_path)
+        stock_gpt_model = tf.keras.models.load_model(
+            stock_gpt_model_path, compile=False
+        )
     except Exception as e:
-        console.print(f"[bold red]❌ {ticker} - Model Loading Failed: {e}[/bold red]")
         logging.error(f"{ticker} - Model Loading Failed: {e}")
         return None
 
     # ✅ Prepare Test Data
     X_test = np.array(
-        [df_test.iloc[i - 60 : i].values for i in range(60, len(df_test))]
+        [
+            df_test.iloc[i - SEQUENCE_LENGTH : i].values
+            for i in range(SEQUENCE_LENGTH, len(df_test))
+        ]
     )
-    y_test_actual = scaler.inverse_transform(
-        np.hstack(
-            [df_test.iloc[60:]["close"].values.reshape(-1, 1)]
-            + [np.zeros((len(df_test) - 60, 1))] * (len(feature_columns) - 1)
-        )
-    )[:, 0]
+    y_test_actual = df_test.iloc[SEQUENCE_LENGTH:]["close"].values
 
     # ✅ Make Predictions
     lstm_rmse = evaluate_predictions(
@@ -185,17 +179,27 @@ def compare_all_models():
         f"[bold cyan]🚀 Comparing StockGPT vs. LSTM for {len(tickers)} tickers...[/bold cyan]"
     )
 
-    with Pool(cpu_count()) as pool:
-        results = pool.map(compare_models, tickers)
+    # ✅ Cleaner progress bar (prevents multiple print lines)
+    results = []
+    with Pool(min(8, cpu_count())) as pool:
+        for result in tqdm(
+            pool.imap(compare_models, tickers),
+            total=len(tickers),
+            desc="Comparison Progress",
+            dynamic_ncols=True,
+        ):
+            if result:
+                results.append(result)
 
-    results = [r for r in results if r is not None]
     results_df = pd.DataFrame(results)
 
     # ✅ Compute Overall Best Model
     best_model_counts = results_df["better_model"].value_counts()
-    overall_best = best_model_counts.idxmax()
+    overall_best = (
+        best_model_counts.idxmax() if not best_model_counts.empty else "No Data"
+    )
 
-    # ✅ Append Overall Result Row (🔥 Fixed `append` issue)
+    # ✅ Append Overall Result Row
     results_df = pd.concat(
         [
             results_df,

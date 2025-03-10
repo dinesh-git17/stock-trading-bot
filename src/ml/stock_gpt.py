@@ -1,39 +1,45 @@
+import multiprocessing
+import os
+
+# ✅ Fix multiprocessing crash on macOS
+if multiprocessing.get_start_method(allow_none=True) is None:
+    multiprocessing.set_start_method("spawn", force=True)
+
+import logging
+import signal
+import sys
+import warnings
+from multiprocessing import Pool, cpu_count
+
+import joblib
 import numpy as np
 import pandas as pd
-import os
-import logging
-import warnings
 import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import (
-    Input,
-    Dense,
-    Dropout,
-    LayerNormalization,
-    MultiHeadAttention,
-    Conv1D,
-    Flatten,
-)
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.preprocessing import MinMaxScaler
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
-from multiprocessing import Pool, cpu_count, Manager
-import joblib
-import signal
-import sys
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.layers import (
+    Conv1D,
+    Dense,
+    Dropout,
+    Flatten,
+    Input,
+    LayerNormalization,
+    MultiHeadAttention,
+)
+from tensorflow.keras.models import Model
+from tqdm import tqdm
 
-# ✅ Fix multiprocessing issue on macOS
-if sys.platform == "darwin":
-    from multiprocessing import set_start_method
+# Suppress TensorFlow logs & warnings
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+tf.get_logger().setLevel("ERROR")
 
-    set_start_method("fork")
-
-# ✅ Load environment variables
+# Load environment variables
 load_dotenv()
 
-# ✅ Setup logging (logs both to file and console)
+# Setup logging
 LOG_FILE = "data/logs/stock_gpt_training.log"
 os.makedirs("data/logs", exist_ok=True)
 
@@ -45,18 +51,14 @@ logging.basicConfig(
 
 console = Console()
 
-# ✅ Suppress warnings & TensorFlow logs
-warnings.filterwarnings("ignore", category=UserWarning)
-tf.get_logger().setLevel("ERROR")
-
-# ✅ Directory Paths
+# Directory Paths
 PROCESSED_DATA_PATH = "data/processed_data/"
 MODEL_PATH = "models/"
 SCALER_PATH = "models/scalers/"
 os.makedirs(MODEL_PATH, exist_ok=True)
 os.makedirs(SCALER_PATH, exist_ok=True)
 
-# ✅ Transformer Configuration
+# Transformer Configuration
 SEQUENCE_LENGTH = 60
 BATCH_SIZE = 32
 EPOCHS = 50
@@ -66,7 +68,6 @@ FF_DIM = 128
 DROPOUT_RATE = 0.2
 
 
-# ✅ Handle Ctrl+C safely
 def signal_handler(sig, frame):
     console.print("\n[bold red]❌ Process interrupted. Exiting safely...[/bold red]")
     logging.info("Process interrupted by user.")
@@ -99,41 +100,54 @@ def load_data(ticker):
 
 
 def prepare_data(df_train, df_test, ticker):
-    """Prepares stock data for Transformer training."""
+    """Prepares stock data for Transformer training with matching feature sets."""
+
     df_train = df_train.select_dtypes(include=[np.number])
     df_test = df_test.select_dtypes(include=[np.number])
 
-    feature_columns = df_train.columns.tolist()
     scaler_file = os.path.join(SCALER_PATH, f"{ticker}_scaler.pkl")
 
-    scaler = MinMaxScaler()
     if os.path.exists(scaler_file):
         scaler = joblib.load(scaler_file)
+        expected_features = (
+            scaler.feature_names_in_
+        )  # 🔥 Auto-detects required features
     else:
-        scaler.fit(df_train[feature_columns])
+        expected_features = df_train.columns.tolist()
+        scaler = MinMaxScaler()
+        scaler.fit(df_train[expected_features])
         joblib.dump(scaler, scaler_file)
 
-    df_train, df_test = scaler.transform(df_train[feature_columns]), scaler.transform(
-        df_test[feature_columns]
-    )
+    # 🔥 Ensure train & test have the same feature names
+    for col in expected_features:
+        if col not in df_train.columns:
+            df_train[col] = 0  # Fill missing columns with 0s
+        if col not in df_test.columns:
+            df_test[col] = 0  # Fill missing columns with 0s
+
+    # Ensure column order matches scaler expectation
+    df_train = df_train[expected_features]
+    df_test = df_test[expected_features]
+
+    df_train = scaler.transform(df_train)
+    df_test = scaler.transform(df_test)
 
     def create_sequences(data):
         X, y = [], []
         for i in range(SEQUENCE_LENGTH, len(data)):
             X.append(data[i - SEQUENCE_LENGTH : i, :])
-            y.append(data[i, feature_columns.index("close")])
+            y.append(data[i, list(expected_features).index("close")])
         return np.array(X), np.array(y).reshape(-1, 1)
 
     X_train, y_train = create_sequences(df_train)
     X_test, y_test = create_sequences(df_test)
 
-    # ✅ Fix: Check if `X_train` or `y_train` is empty and log a warning
     if X_train.shape[0] == 0 or y_train.shape[0] == 0:
         logging.warning(f"{ticker} - Not enough data for training. Skipping...")
         console.print(f"[bold red]⚠ {ticker} - Not enough data. Skipping...[/bold red]")
-        return None, None, None, None, None, None
+        return None, None, None, None
 
-    return X_train, y_train, X_test, y_test, scaler, feature_columns
+    return X_train, y_train, X_test, y_test
 
 
 def transformer_encoder(inputs):
@@ -166,20 +180,15 @@ def build_transformer_model(input_shape):
 
 def train_model(args):
     """Loads data, trains Transformer model, and saves best model."""
-    ticker, completed_jobs, log_queue = args
+    ticker = args
 
     try:
-        log_queue.put(f"{ticker:<6} ⏳ Training model...")
-        logging.info(f"{ticker} - Training started.")
-
         df_train, df_test = load_data(ticker)
         if df_train is None or df_test is None:
-            completed_jobs.append(ticker)
             return ticker, "❌ No Data"
 
-        X_train, y_train, X_test, y_test, _, _ = prepare_data(df_train, df_test, ticker)
+        X_train, y_train, X_test, y_test = prepare_data(df_train, df_test, ticker)
         if X_train is None:
-            completed_jobs.append(ticker)
             return ticker, "❌ Insufficient Data"
 
         model = build_transformer_model((SEQUENCE_LENGTH, X_train.shape[2]))
@@ -204,15 +213,9 @@ def train_model(args):
 
         model.save(model_path, save_format="keras")
 
-        completed_jobs.append(ticker)
-        log_queue.put(f"{ticker:<6} ✅ Model Trained & Saved")
-        logging.info(f"{ticker} - Model trained & saved successfully.")
         return ticker, "✅ Model Trained & Saved"
 
     except Exception as e:
-        completed_jobs.append(ticker)
-        log_queue.put(f"{ticker:<6} ❌ Training Failed: {str(e)}")
-        logging.error(f"{ticker} - Training Failed: {str(e)}")
         return ticker, f"❌ Training Failed: {str(e)}"
 
 
@@ -228,15 +231,23 @@ def process_all_models():
         f"[bold cyan]🚀 Training StockGPT models for {len(tickers)} tickers...[/bold cyan]"
     )
 
-    manager = Manager()
-    completed_jobs = manager.list()
-    log_queue = manager.Queue()
-
-    with Pool(cpu_count()) as pool:
-        pool.map(
-            train_model, [(ticker, completed_jobs, log_queue) for ticker in tickers]
+    with Pool(min(8, cpu_count())) as pool:
+        results = list(
+            tqdm(
+                pool.imap(train_model, tickers),
+                total=len(tickers),
+                desc="Training Progress",
+            )
         )
 
+    table = Table(title="StockGPT Training Results")
+    table.add_column("Ticker", style="cyan", justify="center")
+    table.add_column("Status", style="green", justify="center")
+
+    for ticker, status in results:
+        table.add_row(ticker, status)
+
+    console.print(table)
     count_saved_models()
 
 

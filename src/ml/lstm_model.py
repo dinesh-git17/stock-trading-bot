@@ -1,26 +1,32 @@
+import multiprocessing
+import os
+
+# ✅ Fix multiprocessing crash on macOS
+if multiprocessing.get_start_method(allow_none=True) is None:
+    multiprocessing.set_start_method("spawn", force=True)
+
+import logging
+import signal
+import sys
+import warnings
+from multiprocessing import Pool, cpu_count
+
+import joblib
 import numpy as np
 import pandas as pd
-import os
-import logging
-import warnings
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.preprocessing import MinMaxScaler
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
-from multiprocessing import Pool, cpu_count, Manager, Process
-import joblib
-import signal
-import sys
-from time import sleep
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras.layers import LSTM, Bidirectional, Dense, Dropout, Input
+from tensorflow.keras.models import Model, Sequential
+from tqdm import tqdm
 
-if sys.platform == "darwin":
-    from multiprocessing import set_start_method
-
-    set_start_method("fork")
+# Suppress TensorFlow Metal plugin logs
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+tf.get_logger().setLevel("ERROR")
 
 # Load environment variables
 load_dotenv()
@@ -33,10 +39,6 @@ logging.basicConfig(
 )
 
 console = Console()
-
-# Suppress warnings & TensorFlow logs
-warnings.filterwarnings("ignore", category=UserWarning)
-tf.get_logger().setLevel("ERROR")
 
 # Directory Paths
 PROCESSED_DATA_PATH = "data/processed_data/"
@@ -51,10 +53,7 @@ EPOCHS = 50
 
 
 def signal_handler(sig, frame):
-    console.print(
-        "\n[bold red]❌ Process interrupted. Exiting safely...[/bold red]",
-        justify="left",
-    )
+    console.print("\n[bold red]❌ Process interrupted. Exiting safely...[/bold red]")
     sys.exit(0)
 
 
@@ -62,12 +61,14 @@ signal.signal(signal.SIGINT, signal_handler)
 
 
 def count_saved_models():
+    """Counts and prints the number of saved models."""
     num_models = len([f for f in os.listdir(MODEL_PATH) if f.endswith(".h5")])
     console.print(f"[bold cyan]📊 Total models saved: {num_models}[/bold cyan]")
     return num_models
 
 
 def load_data(ticker):
+    """Loads preprocessed training and test data for a ticker."""
     train_file = os.path.join(PROCESSED_DATA_PATH, f"{ticker}_train.csv")
     test_file = os.path.join(PROCESSED_DATA_PATH, f"{ticker}_test.csv")
 
@@ -78,83 +79,97 @@ def load_data(ticker):
 
 
 def prepare_data(df_train, df_test, ticker):
+    """Prepares train and test data by scaling and creating sequences."""
+
     df_train = df_train.drop(columns=["date"], errors="ignore")
     df_test = df_test.drop(columns=["date"], errors="ignore")
 
-    feature_columns = df_train.select_dtypes(include=[np.number]).columns.tolist()
     scaler_file = os.path.join(SCALER_PATH, f"{ticker}_scaler.pkl")
 
-    scaler = MinMaxScaler()
     if os.path.exists(scaler_file):
         scaler = joblib.load(scaler_file)
+        expected_features = scaler.feature_names_in_  # 🔥 Auto-detects feature names
     else:
-        scaler.fit(df_train[feature_columns])
+        # If scaler doesn't exist, use train columns as expected features
+        expected_features = df_train.select_dtypes(include=[np.number]).columns.tolist()
+        scaler = MinMaxScaler()
+        scaler.fit(df_train[expected_features])
         joblib.dump(scaler, scaler_file)
 
-    df_train[feature_columns] = scaler.transform(df_train[feature_columns])
-    df_test[feature_columns] = scaler.transform(df_test[feature_columns])
+    # 🔥 Ensure train & test have the same feature names
+    for col in expected_features:
+        if col not in df_train.columns:
+            df_train[col] = 0  # Fill missing columns with 0s
+        if col not in df_test.columns:
+            df_test[col] = 0  # Fill missing columns with 0s
+
+    # Ensure column order matches scaler expectation
+    df_train = df_train[expected_features]
+    df_test = df_test[expected_features]
+
+    df_train[expected_features] = scaler.transform(df_train[expected_features])
+    df_test[expected_features] = scaler.transform(df_test[expected_features])
 
     def create_sequences(data):
         X, y = [], []
         for i in range(SEQUENCE_LENGTH, len(data)):
             X.append(data[i - SEQUENCE_LENGTH : i, :])
-            y.append(data[i, feature_columns.index("close")])
+            y.append(data[i, list(expected_features).index("close")])
         return np.array(X), np.array(y).reshape(-1, 1)
 
-    X_train, y_train = create_sequences(df_train[feature_columns].values)
-    X_test, y_test = create_sequences(df_test[feature_columns].values)
+    X_train, y_train = create_sequences(df_train.values)
+    X_test, y_test = create_sequences(df_test.values)
 
-    return X_train, y_train, X_test, y_test, scaler, feature_columns
+    return X_train, y_train, X_test, y_test
 
 
 def build_lstm_model(input_shape):
-    model = Sequential(
-        [
-            Bidirectional(
-                LSTM(units=128, return_sequences=True), input_shape=input_shape
-            ),
-            Dropout(0.2),
-            Bidirectional(LSTM(units=128, return_sequences=False)),
-            Dropout(0.2),
-            Dense(units=64, activation="relu"),
-            Dense(units=1),
-        ]
-    )
+    """Builds a bidirectional LSTM model with explicit Input() layer."""
+    inputs = Input(shape=input_shape)
+
+    x = Bidirectional(LSTM(units=128, return_sequences=True))(inputs)
+    x = Dropout(0.2)(x)
+
+    x = Bidirectional(LSTM(units=128, return_sequences=False))(x)
+    x = Dropout(0.2)(x)
+
+    x = Dense(units=64, activation="relu")(x)
+    outputs = Dense(units=1)(x)
+
+    model = Model(inputs, outputs)
     model.compile(optimizer="adam", loss="mean_squared_error")
+
     return model
 
 
 def train_model(args):
-    ticker, completed_jobs, log_queue = args
+    """Trains an LSTM model for a given ticker."""
+    ticker, _ = args
 
     try:
-        log_queue.put(f"[bold yellow]{ticker:<6} ⏳ Training model...[/bold yellow]")
-
         df_train, df_test = load_data(ticker)
         if df_train is None or df_test is None:
-            completed_jobs.append(ticker)
             return ticker, "❌ Skipped (No Data)"
 
-        X_train, y_train, X_test, y_test, scaler, feature_columns = prepare_data(
-            df_train, df_test, ticker
-        )
+        X_train, y_train, X_test, y_test = prepare_data(df_train, df_test, ticker)
         if len(X_train) == 0 or len(X_test) == 0:
-            completed_jobs.append(ticker)
             return ticker, "❌ Skipped (Insufficient Data)"
 
         model = build_lstm_model((SEQUENCE_LENGTH, X_train.shape[2]))
         model_checkpoint_path = os.path.join(MODEL_PATH, f"lstm_{ticker}.h5")
 
-        model_checkpoint = ModelCheckpoint(
-            model_checkpoint_path,
-            save_best_only=True,
-            monitor="val_loss",
-            mode="min",
-            verbose=0,
-        )
-        early_stopping = EarlyStopping(
-            monitor="val_loss", patience=5, restore_best_weights=True, verbose=0
-        )
+        callbacks = [
+            ModelCheckpoint(
+                model_checkpoint_path,
+                save_best_only=True,
+                monitor="val_loss",
+                mode="min",
+                verbose=0,
+            ),
+            EarlyStopping(
+                monitor="val_loss", patience=5, restore_best_weights=True, verbose=0
+            ),
+        ]
 
         train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(
             BATCH_SIZE
@@ -168,28 +183,17 @@ def train_model(args):
             epochs=EPOCHS,
             validation_data=test_dataset,
             verbose=0,
-            callbacks=[early_stopping, model_checkpoint],
+            callbacks=callbacks,
         )
 
-        completed_jobs.append(ticker)
-        log_queue.put(f"[bold green]{ticker:<6} ✅ Model Trained & Saved[/bold green]")
         return ticker, "✅ Model Trained & Saved"
 
     except Exception as e:
-        completed_jobs.append(ticker)
-        log_queue.put(f"[bold red]{ticker:<6} ❌ Training Failed: {str(e)}[/bold red]")
         return ticker, f"❌ Training Failed: {str(e)}"
 
 
-def logger_process(log_queue):
-    while True:
-        message = log_queue.get()
-        if message is None:
-            break
-        console.print(message)
-
-
 def process_all_models():
+    """Trains LSTM models for all available tickers in parallel."""
     tickers = [
         f.split("_")[0]
         for f in os.listdir(PROCESSED_DATA_PATH)
@@ -197,25 +201,19 @@ def process_all_models():
     ]
 
     console.print(
-        f"[bold cyan]🚀 Training LSTM models for {len(tickers)} tickers...[/bold cyan]",
-        justify="left",
+        f"[bold cyan]🚀 Training LSTM models for {len(tickers)} tickers...[/bold cyan]"
     )
 
-    manager = Manager()
-    completed_jobs = manager.list()
-    log_queue = manager.Queue()
-
-    log_proc = Process(target=logger_process, args=(log_queue,))
-    log_proc.start()
-
-    with Pool(cpu_count()) as pool:
-        results = pool.map(
-            train_model, [(ticker, completed_jobs, log_queue) for ticker in tickers]
+    with Pool(min(8, cpu_count())) as pool:
+        results = list(
+            tqdm(
+                pool.imap(train_model, [(ticker, None) for ticker in tickers]),
+                total=len(tickers),
+                desc="Training Progress",
+            )
         )
 
-    log_queue.put(None)  # Stop logger
-    log_proc.join()
-
+    # Display summary table
     table = Table(title="LSTM Training Results")
     table.add_column("Ticker", style="cyan", justify="center")
     table.add_column("Status", style="green", justify="center")
@@ -224,9 +222,7 @@ def process_all_models():
         table.add_row(ticker, status)
 
     console.print(table)
-    console.print(
-        "[bold green]✅ All LSTM model training complete![/bold green]", justify="left"
-    )
+    console.print("[bold green]✅ All LSTM model training complete![/bold green]")
     count_saved_models()
 
 
