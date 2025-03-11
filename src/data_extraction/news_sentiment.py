@@ -1,5 +1,7 @@
 import logging
 import os
+import signal
+import sys
 import time
 from datetime import datetime
 
@@ -63,6 +65,17 @@ NEWS_SOURCES = [
     "reddit",  # Backup 4
     "twitter",  # Backup 5
 ]
+
+
+# ✅ Graceful Exit Handler
+def handle_exit(signum, frame):
+    console.print("\n[bold red]⚠ Process interrupted! Exiting ...[/bold red]")
+    sys.exit(0)
+
+
+# ✅ Register signal handlers for clean exit
+signal.signal(signal.SIGINT, handle_exit)  # Handle Ctrl+C
+signal.signal(signal.SIGTERM, handle_exit)  # Handle termination signals
 
 
 ### **🚀 Fetch Stock News with Backup Sources**
@@ -174,10 +187,7 @@ def fetch_stock_news(ticker, max_retries=3):
 
 ### **🚀 Sentiment Analysis**
 def analyze_sentiment(text):
-    """
-    Analyzes sentiment of a news article using VADER.
-    Returns a polarity score between -1 (negative) to 1 (positive).
-    """
+    """Analyzes sentiment of a news article using VADER."""
     analyzer = SentimentIntensityAnalyzer()
     return round(analyzer.polarity_scores(text)["compound"], 3)
 
@@ -209,20 +219,16 @@ def store_sentiment_data(cursor, ticker, articles):
 
     if records:
         cursor.executemany(sql, records)
-        return True  # ✅ Indicate that data was stored
-    return False  # ✅ No data stored
+        return True
+    return False
 
 
-### **🚀 Process News Sentiment for All Stocks with Progress Bar**
+### **🚀 Process News Sentiment**
 def process_news_sentiment():
-    """
-    Fetches news articles, analyzes sentiment, and stores results with a modern progress bar.
-    """
     conn = psycopg2.connect(
         dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
     )
     cursor = conn.cursor()
-
     cursor.execute("SELECT DISTINCT ticker FROM stocks;")
     tickers = [row[0] for row in cursor.fetchall()]
 
@@ -231,30 +237,29 @@ def process_news_sentiment():
         style="bold cyan",
     )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn(
-            "[bold blue] Fetching & analyzing news sentiment for {task.fields[ticker]}..."
-        ),
-        BarColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("", total=len(tickers), ticker="Starting...")
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue] Processing {task.fields[ticker]}..."),
+            BarColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("", total=len(tickers), ticker="Starting...")
 
-        for ticker in tickers:
-            progress.update(
-                task, ticker=ticker
-            )  # Update progress bar with current ticker
-            articles = fetch_stock_news(ticker)
-            if articles and store_sentiment_data(cursor, ticker, articles):
-                conn.commit()
-                logging.info(f"✅ Stored news sentiment for {ticker}")
-                progress.advance(task)
+            for ticker in tickers:
+                progress.update(task, ticker=ticker)
+                articles = fetch_stock_news(ticker)
+                if articles and store_sentiment_data(cursor, ticker, articles):
+                    conn.commit()
+                    logging.info(f"✅ Stored news sentiment for {ticker}")
+                    progress.advance(task)
+
+    except KeyboardInterrupt:
+        handle_exit(None, None)
 
     conn.close()
-    console.print("\n[bold green]✅ News sentiment analysis completed![/bold green]\n")
 
 
 if __name__ == "__main__":
