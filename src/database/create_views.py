@@ -5,19 +5,22 @@ import psycopg2
 from dotenv import load_dotenv
 from rich.console import Console
 
-# Load environment variables from .env file
+# ✅ Load environment variables
 load_dotenv()
 
-# Setup logging
+# ✅ Setup Logging
+LOG_FILE = "data/logs/database_views.log"
+os.makedirs("data/logs", exist_ok=True)
+
 logging.basicConfig(
-    filename="data/logs/database_views.log",
+    filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 console = Console()
 
-# Database Configuration
+# ✅ Database Configuration
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
@@ -39,78 +42,139 @@ def connect_db():
         return conn
     except Exception as e:
         console.print(f"[bold red]❌ Database connection error:[/bold red] {e}")
-        logging.error(f"Database connection error: {e}")
+        logging.error(f"Database connection error: {e}", exc_info=True)
         return None
 
 
 def create_views():
-    """Creates SQL views for optimized data access."""
+    """Creates SQL views and materialized views for optimized data access."""
     conn = connect_db()
     if not conn:
         return
 
     with conn.cursor() as cur:
         try:
-            # ✅ Drop all views using CASCADE to remove dependencies
+            console.print("[bold yellow]🔄 Dropping old views...[/bold yellow]")
+            cur.execute("DROP VIEW IF EXISTS latest_stock_data CASCADE;")
+            cur.execute("DROP VIEW IF EXISTS high_momentum_stocks CASCADE;")
+            cur.execute("DROP VIEW IF EXISTS oversold_stocks CASCADE;")
+            cur.execute("DROP VIEW IF EXISTS market_trend_analysis CASCADE;")
             cur.execute("DROP VIEW IF EXISTS stock_sector_analysis CASCADE;")
-            cur.execute("DROP VIEW IF EXISTS stock_filtered_by_timeframe CASCADE;")
-            cur.execute("DROP VIEW IF EXISTS stock_analysis_view CASCADE;")
 
-            # View 1: General Stock Analysis
+            cur.execute(
+                "DROP MATERIALIZED VIEW IF EXISTS materialized_stock_analysis CASCADE;"
+            )
+            cur.execute(
+                "DROP MATERIALIZED VIEW IF EXISTS materialized_sector_performance CASCADE;"
+            )
+
+            console.print("[bold blue]🔄 Creating new views...[/bold blue]")
+
+            # ✅ View: Latest Stock Data (Real-time Data)
             cur.execute(
                 """
-                CREATE VIEW stock_analysis_view AS
-                SELECT
-                    s.ticker,
-                    s.date,
-                    s.open,
-                    s.high,
-                    s.low,
-                    s.close,
-                    s.volume,
-                    s.dividends,
-                    s.stock_splits,
-                    ti.sma_20,
-                    ti.ema_20,
-                    ti.rsi_14,
-                    ti.macd,
-                    ti.macd_signal,
-                    ti.macd_hist,
-                    ti.bb_upper,
-                    ti.bb_middle,
-                    ti.bb_lower
+                CREATE VIEW latest_stock_data AS
+                SELECT DISTINCT ON (s.ticker) s.*
                 FROM stocks s
-                LEFT JOIN technical_indicators ti
-                ON s.ticker = ti.ticker AND s.date = ti.date
-                ORDER BY s.ticker, s.date;
+                ORDER BY s.ticker, s.date DESC;
             """
             )
 
-            # View 2: Filter by Timeframe (Last 30 Days)
+            # ✅ View: High Momentum Stocks (Identifies MACD & RSI crossovers)
             cur.execute(
                 """
-                CREATE VIEW stock_filtered_by_timeframe AS
-                SELECT *
-                FROM stock_analysis_view
-                WHERE date >= CURRENT_DATE - INTERVAL '30 days';
+                CREATE VIEW high_momentum_stocks AS
+                SELECT s.ticker, s.date, s.close, ti.rsi_14, ti.macd, ti.macd_signal
+                FROM stocks s
+                JOIN technical_indicators ti ON s.ticker = ti.ticker AND s.date = ti.date
+                WHERE ti.rsi_14 > 50 AND ti.macd > ti.macd_signal
+                ORDER BY ti.rsi_14 DESC;
             """
             )
 
-            # View 3: Stock Sector Analysis
+            # ✅ View: Oversold Stocks (RSI below 30 - Potential Buy Signals)
+            cur.execute(
+                """
+                CREATE VIEW oversold_stocks AS
+                SELECT s.ticker, s.date, s.close, ti.rsi_14
+                FROM stocks s
+                JOIN technical_indicators ti ON s.ticker = ti.ticker AND s.date = ti.date
+                WHERE ti.rsi_14 < 30
+                ORDER BY ti.rsi_14 ASC;
+            """
+            )
+
+            # ✅ View: Market Trend Analysis (Aggregates Trends)
+            cur.execute(
+                """
+                CREATE VIEW market_trend_analysis AS
+                SELECT s.ticker, 
+                       MIN(s.close) AS min_price, 
+                       MAX(s.close) AS max_price, 
+                       AVG(s.close) AS avg_price, 
+                       COUNT(s.date) AS days_tracked
+                FROM stocks s
+                WHERE s.date >= CURRENT_DATE - INTERVAL '90 days'
+                GROUP BY s.ticker
+                ORDER BY avg_price DESC;
+            """
+            )
+
+            # ✅ View: Stock Sector Performance
             cur.execute(
                 """
                 CREATE VIEW stock_sector_analysis AS
-                SELECT s.*, si.sector
+                SELECT si.sector, 
+                       COUNT(s.ticker) AS total_stocks, 
+                       AVG(s.close) AS avg_sector_price
                 FROM stocks s
                 JOIN stock_info si ON s.ticker = si.ticker
-                ORDER BY si.sector, s.ticker, s.date;
+                GROUP BY si.sector
+                ORDER BY avg_sector_price DESC;
             """
             )
 
             console.print(
-                "[bold green]✅ Enhanced SQL views created successfully![/bold green]"
+                "[bold green]✅ Standard views created successfully![/bold green]"
             )
-            logging.info("Enhanced SQL views created successfully.")
+
+            console.print(
+                "[bold yellow]🔄 Creating materialized views...[/bold yellow]"
+            )
+
+            # ✅ Materialized View: Cached Stock Analysis
+            cur.execute(
+                """
+                CREATE MATERIALIZED VIEW materialized_stock_analysis AS
+                SELECT s.ticker, s.date, s.open, s.high, s.low, s.close, s.volume,
+                       ti.sma_50, ti.ema_50, ti.rsi_14, ti.macd, ti.macd_signal,
+                       si.market_cap, si.pe_ratio, si.earnings_date
+                FROM stocks s
+                JOIN technical_indicators ti ON s.ticker = ti.ticker AND s.date = ti.date
+                JOIN stock_info si ON s.ticker = si.ticker
+                ORDER BY s.ticker, s.date;
+            """
+            )
+
+            # ✅ Materialized View: Sector Performance Analysis
+            cur.execute(
+                """
+                CREATE MATERIALIZED VIEW materialized_sector_performance AS
+                SELECT si.sector, 
+                       COUNT(s.ticker) AS total_stocks, 
+                       SUM(si.market_cap) AS total_market_cap, 
+                       AVG(s.close) AS avg_sector_price
+                FROM stocks s
+                JOIN stock_info si ON s.ticker = si.ticker
+                GROUP BY si.sector
+                ORDER BY total_market_cap DESC;
+            """
+            )
+
+            console.print(
+                "[bold green]✅ Materialized views created successfully![/bold green]"
+            )
+            logging.info("Materialized views created successfully.")
 
         except Exception as e:
             console.print(f"[bold red]❌ Error creating SQL views:[/bold red] {e}")
@@ -119,5 +183,31 @@ def create_views():
     conn.close()
 
 
+def refresh_materialized_views():
+    """Refreshes materialized views for up-to-date stock analysis."""
+    conn = connect_db()
+    if not conn:
+        return
+
+    with conn.cursor() as cur:
+        try:
+            console.print("[bold blue]🔄 Refreshing materialized views...[/bold blue]")
+            cur.execute("REFRESH MATERIALIZED VIEW materialized_stock_analysis;")
+            cur.execute("REFRESH MATERIALIZED VIEW materialized_sector_performance;")
+            console.print(
+                "[bold green]✅ Materialized views refreshed successfully![/bold green]"
+            )
+            logging.info("Materialized views refreshed successfully.")
+
+        except Exception as e:
+            console.print(
+                f"[bold red]❌ Error refreshing materialized views:[/bold red] {e}"
+            )
+            logging.error(f"Error refreshing materialized views: {e}")
+
+    conn.close()
+
+
 if __name__ == "__main__":
     create_views()
+    refresh_materialized_views()

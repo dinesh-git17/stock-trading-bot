@@ -7,16 +7,27 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 
 # ✅ Load environment variables
 load_dotenv()
 
-# ✅ Setup logging
+# ✅ Setup Logging
+LOG_FILE = "data/logs/data_preprocessing.log"
+os.makedirs("data/logs", exist_ok=True)
+
 logging.basicConfig(
-    filename="data/logs/data_preprocessing.log",
+    filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
@@ -32,76 +43,108 @@ os.makedirs(PROCESSED_DATA_PATH, exist_ok=True)
 def load_data(ticker):
     """Loads the training data for a given ticker."""
     file_path = os.path.join(TRAINING_DATA_PATH, f"training_data_{ticker}.csv")
+
     if not os.path.exists(file_path):
         logging.warning(f"⚠ File not found: {file_path}")
         return None
 
-    df = pd.read_csv(file_path)
-    df["date"] = pd.to_datetime(df["date"])
+    df = pd.read_csv(
+        file_path,
+        parse_dates=["date"],
+        dtype={
+            "open": "float32",
+            "high": "float32",
+            "low": "float32",
+            "close": "float32",
+            "volume": "int64",
+        },
+    )
 
     return df if not df.empty else None
 
 
 def handle_missing_data(df):
-    """Handles missing values using interpolation and fills."""
-    if df.isnull().sum().sum() > 0:
-        df.interpolate(method="linear", inplace=True)
-        df.ffill(inplace=True)
-        df.bfill(inplace=True)
+    """Handles missing values using adaptive imputation."""
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
 
-    df.dropna(inplace=True)
+    # Fill missing 'close' & 'volume' with median values
+    df["close"].fillna(df["close"].median(), inplace=True)
+    df["volume"].fillna(df["volume"].median(), inplace=True)
 
-    if df.empty:
-        logging.warning("⚠ All data removed after missing value handling!")
-        return None
+    df.dropna(subset=["close", "volume"], inplace=True)
 
-    return df
+    return df if not df.empty else None
 
 
 def feature_engineering(df):
-    """Performs feature engineering by adding rolling averages and time-lagged features."""
+    """Adds technical indicators while ensuring minimal data loss."""
     df = df.sort_values(by="date")
 
-    # ✅ Moving Averages (SMA & EMA)
+    # ✅ Moving Averages
     df["sma_20"] = df["close"].rolling(window=20, min_periods=1).mean()
+    df["sma_50"] = df["close"].rolling(window=50, min_periods=1).mean()
     df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-    # ✅ Volatility (Rolling Std Deviation)
+    # ✅ Bollinger Bands
     df["volatility"] = df["close"].rolling(window=10, min_periods=1).std()
+    df["bb_upper"] = df["sma_20"] + (df["volatility"] * 2)
+    df["bb_lower"] = df["sma_20"] - (df["volatility"] * 2)
 
-    # ✅ Time-Lagged Features (Previous Close Prices)
+    # ✅ MACD (Moving Average Convergence Divergence)
+    short_ema = df["close"].ewm(span=12, adjust=False).mean()
+    long_ema = df["close"].ewm(span=26, adjust=False).mean()
+    df["macd"] = short_ema - long_ema
+    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+
+    # ✅ RSI (Relative Strength Index)
+    delta = df["close"].diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(window=14, min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(window=14, min_periods=1).mean()
+    rs = avg_gain / (avg_loss + 1e-9)  # Avoid division by zero
+    df["rsi_14"] = 100 - (100 / (1 + rs))
+
+    # ✅ Log Transform Volume (reduces outliers)
+    df["log_volume"] = np.log1p(df["volume"])
+
+    # ✅ Time-Lagged Features (Previous Prices)
     for lag in range(1, 6):
         df[f"close_lag_{lag}"] = df["close"].shift(lag)
 
     df.dropna(inplace=True)
 
-    if df.empty:
-        logging.warning("⚠ Data removed after feature engineering!")
-        return None
-
-    return df
+    return df if not df.empty else None
 
 
 def scale_data(df):
-    """Scales numerical features using StandardScaler."""
+    """Scales numerical features using RobustScaler to handle outliers."""
     feature_columns = [
         "open",
         "high",
         "low",
         "close",
-        "volume",
         "sma_20",
+        "sma_50",
         "ema_20",
+        "ema_50",
         "volatility",
+        "bb_upper",
+        "bb_lower",
+        "macd",
+        "macd_signal",
+        "rsi_14",
+        "log_volume",
     ] + [f"close_lag_{i}" for i in range(1, 6)]
 
     feature_columns = [col for col in feature_columns if col in df.columns]
 
-    if df.empty or len(df) < 1:
-        logging.warning("⚠ Skipping StandardScaler - No valid data available.")
+    if df.empty:
         return None
 
-    scaler = StandardScaler()
+    scaler = RobustScaler()
     df[feature_columns] = scaler.fit_transform(df[feature_columns])
 
     return df
@@ -109,8 +152,7 @@ def scale_data(df):
 
 def train_test_split_data(df, ticker):
     """Splits the data into train-test sets and saves them."""
-    if df is None or df.empty:
-        logging.warning(f"⚠ Skipping {ticker} - No data after preprocessing.")
+    if df is None:
         return
 
     train, test = train_test_split(df, test_size=0.2, shuffle=False)
@@ -156,23 +198,17 @@ def process_all_data():
         if f.startswith("training_data")
     ]
 
-    console.print(
-        f"[bold cyan]🚀 Processing {len(tickers)} tickers using {min(8, os.cpu_count())} threads...[/bold cyan]"
-    )
+    console.print(f"[bold cyan]🚀 Processing {len(tickers)} tickers...[/bold cyan]")
 
-    results = []
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=min(8, os.cpu_count())
     ) as executor:
-        for result in executor.map(process_ticker, tickers):
-            results.append(result)
+        results = list(executor.map(process_ticker, tickers))
 
     console.print("\n[bold green]✅ All data preprocessing complete![/bold green]\n")
 
-    # ✅ Display summary table
     table = Table(title="Preprocessing Summary")
     table.add_column("Status", justify="center", style="cyan", no_wrap=True)
-
     for result in results:
         table.add_row(result)
 

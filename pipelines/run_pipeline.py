@@ -25,7 +25,6 @@ SCRIPTS = [
     ("Fetch OHLCV Data", "src/data_extraction/ohlc_data_retriever.py"),
     ("Calculate Technical Indicators", "src/data_extraction/technical_indicators.py"),
     ("Clean & Validate Data", "src/data_processing/data_cleaning.py"),
-    ("Fetch Stock Metadata", "src/database/store_stock_metadata.py"),
     ("Fetch News Sentiment", "src/data_extraction/news_sentiment.py"),
     ("Load Data into Database", "src/database/load_data.py"),
     ("Populate Stock Info", "src/database/populate_stock_info.py"),

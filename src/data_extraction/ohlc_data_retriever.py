@@ -125,7 +125,7 @@ def fetch_stock_data_alpha_vantage(ticker):
     return None
 
 
-def fetch_stock_data_yahoo(ticker, start="2023-01-01", end=None):
+def fetch_stock_data_yahoo(ticker, start="2015-01-01", end=None):
     """
     Fetch stock data from Yahoo Finance using yfinance.
     """

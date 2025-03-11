@@ -1,4 +1,6 @@
 import logging
+import signal
+import sys
 import time
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -8,9 +10,10 @@ from rich.console import Console
 from stock_data_collector import fetch_most_active_stocks
 from technical_indicators import process_all_stocks
 
-# Setup logging
+# ✅ Setup Logging
+LOG_FILE = "data/logs/scheduler.log"
 logging.basicConfig(
-    filename="data/logs/scheduler.log",
+    filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
@@ -28,13 +31,16 @@ def update_stock_data():
     logging.info("Updating stock data...")
 
     try:
-        # Fetch new trending stocks
+        # ✅ Fetch new trending stocks
         most_active_stocks = fetch_most_active_stocks()
 
-        # Update OHLCV data
+        if not most_active_stocks:
+            raise ValueError("No active stocks retrieved.")
+
+        # ✅ Update OHLCV data
         fetch_ohlc_data(most_active_stocks)
 
-        # Recalculate technical indicators
+        # ✅ Recalculate technical indicators
         process_all_stocks()
 
         console.print("[bold green]✅ Stock data update complete![/bold green]")
@@ -42,7 +48,7 @@ def update_stock_data():
 
     except Exception as e:
         console.print(f"[bold red]❌ Error updating stock data:[/bold red] {e}")
-        logging.error(f"Error updating stock data: {e}")
+        logging.error(f"Error updating stock data: {e}", exc_info=True)
 
 
 def start_scheduler():
@@ -52,6 +58,9 @@ def start_scheduler():
     console.print(
         "\n[bold cyan]📅 Starting automated stock data updates (every hour)...[/bold cyan]\n"
     )
+    logging.info("Scheduler started. Running stock updates every hour.")
+
+    # ✅ Schedule job with error handling
     scheduler.add_job(
         update_stock_data,
         IntervalTrigger(hours=1),
@@ -59,15 +68,23 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # Start scheduler
     scheduler.start()
+
+    # ✅ Graceful exit handling
+    def graceful_shutdown(signum, frame):
+        console.print("\n[bold red]⏹ Scheduler stopping...[/bold red]")
+        logging.info("Scheduler shutting down...")
+        scheduler.shutdown()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, graceful_shutdown)  # Handle Ctrl+C
+    signal.signal(signal.SIGTERM, graceful_shutdown)  # Handle termination signals
 
     try:
         while True:
             time.sleep(1)  # Keep script running
     except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
-        console.print("\n[bold red]⏹ Scheduler stopped.[/bold red]")
+        graceful_shutdown(None, None)
 
 
 if __name__ == "__main__":

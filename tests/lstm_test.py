@@ -4,164 +4,151 @@ import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from rich.console import Console
-from rich.table import Table
-from tensorflow.keras.models import load_model
+import tensorflow as tf
+from prettytable import PrettyTable  # Install with: pip install prettytable
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-# ✅ Paths
+# Paths
 MODEL_PATH = "models/"
 SCALER_PATH = "models/scalers/"
 PROCESSED_DATA_PATH = "data/processed_data/"
-SEQUENCE_LENGTH = 60
-
-console = Console()
+SEQUENCE_LENGTH = 60  # Ensure it matches training config
 
 
-def load_trained_model(ticker):
-    """Loads a trained LSTM model for a specific stock ticker."""
+# Function to load model
+def load_model(ticker):
     model_file = os.path.join(MODEL_PATH, f"lstm_{ticker}.h5")
-    if not os.path.exists(model_file):
-        raise FileNotFoundError(f"Model file {model_file} not found!")
-    return load_model(model_file)
+    if os.path.exists(model_file):
+        return tf.keras.models.load_model(model_file)
+    else:
+        raise FileNotFoundError(f"Model file not found for {ticker}")
 
 
-def load_scaler(ticker):
-    """Loads the MinMaxScaler used for training."""
-    scaler_file = os.path.join(SCALER_PATH, f"{ticker}_scaler.pkl")
-    if not os.path.exists(scaler_file):
-        raise FileNotFoundError(f"Scaler file {scaler_file} not found!")
-    return joblib.load(scaler_file)
-
-
+# Function to load and preprocess data
 def load_test_data(ticker):
-    """Loads the actual test data including the true stock prices."""
+    """Loads and preprocesses test data, ensuring feature consistency."""
     test_file = os.path.join(PROCESSED_DATA_PATH, f"{ticker}_test.csv")
+    scaler_file = os.path.join(SCALER_PATH, f"{ticker}_scaler.pkl")
 
-    if not os.path.exists(test_file):
-        raise FileNotFoundError(f"Test data file {test_file} not found!")
+    if not os.path.exists(test_file) or not os.path.exists(scaler_file):
+        raise FileNotFoundError(f"Test data or scaler missing for {ticker}")
 
     df_test = pd.read_csv(test_file)
-    return df_test
 
+    # Load the scaler and retrieve the feature names used during training
+    scaler = joblib.load(scaler_file)
 
-def preprocess_test_data(ticker):
-    """Loads and preprocesses test data to match the training format."""
-    df_test = load_test_data(ticker)
-    df_test = df_test.select_dtypes(include=[np.number])
+    # Identify only the columns that were used for scaling
+    training_features = scaler.feature_names_in_
 
-    # Load and apply the saved scaler
-    scaler = load_scaler(ticker)
-    expected_features = scaler.feature_names_in_
+    # Ensure the test data has the same columns and order
+    df_test = df_test[training_features]
 
-    for col in expected_features:
-        if col not in df_test.columns:
-            df_test[col] = 0  # Fill missing features with zeros
+    # Extract actual target values (last column is assumed to be the target)
+    y_test_actual = df_test.iloc[SEQUENCE_LENGTH:, -1].values
 
-    df_test = df_test[expected_features]
-    scaled_data = scaler.transform(df_test)
+    # Scale the test data using the fitted scaler
+    data_scaled = scaler.transform(df_test)
 
-    # Create sequences
+    # Prepare sequences
     X_test = []
-    for i in range(SEQUENCE_LENGTH, len(scaled_data)):
-        X_test.append(scaled_data[i - SEQUENCE_LENGTH : i, :])
+    for i in range(SEQUENCE_LENGTH, len(data_scaled)):
+        X_test.append(data_scaled[i - SEQUENCE_LENGTH : i])
 
-    return (
-        np.array(X_test),
-        df_test.iloc[SEQUENCE_LENGTH:]["close"].values,
-    )  # Return true close prices too
+    return np.array(X_test), y_test_actual, scaler
 
 
-def predict_stock_price(ticker):
-    """Uses the trained LSTM model to predict stock prices."""
-    model = load_trained_model(ticker)
-    X_test, actual_prices = preprocess_test_data(ticker)
+# Function to evaluate model
+def evaluate_model(model, X_test, y_test_actual, scaler):
+    y_pred_scaled = model.predict(X_test)
 
-    if len(X_test) == 0:
-        raise ValueError("Not enough test data to make predictions.")
-
-    predictions = model.predict(X_test)
-    return predictions, actual_prices
-
-
-def inverse_transform_predictions(predictions, ticker):
-    """Transforms predictions back to the original stock price scale."""
-    scaler = load_scaler(ticker)
-
-    # Ensure predictions are reshaped to match scaler expectations
-    predictions = np.array(predictions).reshape(-1, 1)
-
-    # Create a dummy array of zeros with the same feature count
-    dummy_data = np.zeros((predictions.shape[0], len(scaler.feature_names_in_)))
-    close_index = list(scaler.feature_names_in_).index("close")
-    dummy_data[:, close_index] = predictions[:, 0]
-
-    # Apply inverse transformation
-    transformed_predictions = scaler.inverse_transform(dummy_data)[:, close_index]
-    return transformed_predictions
-
-
-def display_results_table(ticker, actual_prices, predicted_prices):
-    """Displays a clear Rich table comparing actual vs. predicted prices, with prediction quality."""
-    table = Table(title=f"{ticker} Stock Price Prediction vs Actual", show_lines=True)
-    table.add_column("Index", justify="center", style="cyan", no_wrap=True)
-    table.add_column("Actual Price ($)", justify="center", style="green")
-    table.add_column("Predicted Price ($)", justify="center", style="blue")
-    table.add_column("Difference ($)", justify="center", style="red")
-    table.add_column("Prediction Quality", justify="center", style="magenta")
-
-    for i in range(min(10, len(actual_prices))):
-        diff = round(abs(actual_prices[i] - predicted_prices[i]), 2)
-        percentage_error = (diff / actual_prices[i]) * 100
-
-        # Determine prediction quality
-        if percentage_error <= 1:
-            quality = "✅ Good"
-        elif percentage_error <= 3:
-            quality = "⚠️ Moderate"
-        else:
-            quality = "❌ Poor"
-
-        table.add_row(
-            str(i + 1),
-            f"{actual_prices[i]:.2f}",
-            f"{predicted_prices[i]:.2f}",
-            f"{diff:.2f}",
-            quality,
+    # Inverse transform predictions
+    y_pred = scaler.inverse_transform(
+        np.hstack(
+            [np.zeros((y_pred_scaled.shape[0], X_test.shape[2] - 1)), y_pred_scaled]
         )
+    )[
+        :, -1
+    ]  # Extract only the last column (target)
 
-    console.print(table)
-    console.print("\n💡 [bold yellow]Prediction Quality Explanation:[/bold yellow]")
-    console.print(
-        "✅ [bold green]Good[/bold green]: Difference ≤ 1% of actual price (Highly accurate)"
+    # Compute metrics
+    mae = mean_absolute_error(y_test_actual, y_pred)
+    mse = mean_squared_error(y_test_actual, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_test_actual, y_pred)
+
+    # Determine performance quality
+    performance = "Good" if r2 > 0.75 else "Needs Improvement"
+
+    # Create DataFrame for results
+    results_df = pd.DataFrame(
+        {
+            "Actual Price": y_test_actual,
+            "Predicted Price": y_pred,
+            "Performance": performance,
+        }
     )
-    console.print(
-        "⚠️ [bold yellow]Moderate[/bold yellow]: Difference between 1% - 3% (Acceptable)"
+
+    return results_df, {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2 Score": r2}
+
+
+# Function to display results in a table (terminal)
+def display_table(df):
+    table = PrettyTable()
+    table.field_names = ["Actual Price", "Predicted Price", "Performance"]
+
+    for _, row in df.head(10).iterrows():  # Show first 10 rows
+        table.add_row(row.tolist())
+
+    print("\nPredicted vs Actual Prices:")
+    print(table)
+
+
+# Function to plot results
+def plot_results(results_df, ticker):
+    plt.figure(figsize=(12, 6))
+    plt.plot(results_df["Actual Price"], label="Actual Price", color="blue")
+    plt.plot(
+        results_df["Predicted Price"],
+        label="Predicted Price",
+        color="red",
+        linestyle="dashed",
     )
-    console.print("❌ [bold red]Poor[/bold red]: Difference > 3% (Inaccurate)\n")
+    plt.title(f"Stock Price Prediction - {ticker}")
+    plt.xlabel("Time")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.show()
 
 
-# ✅ Example Usage
-ticker = "AAPL"  # Replace with your stock ticker
-console.print(
-    f"\n[bold cyan]📊 Running stock price predictions for {ticker}...[/bold cyan]\n"
-)
+# Main execution
+if __name__ == "__main__":
+    ticker = "AAPL"  # Change to desired stock ticker
 
-predictions, actual_prices = predict_stock_price(ticker)
-original_predictions = inverse_transform_predictions(predictions, ticker)
+    try:
+        print(f"Evaluating model for {ticker}...")
 
-console.print(
-    f"\n✅ [bold green]Predictions completed! Displaying results for {ticker}.[/bold green]\n"
-)
+        # Load model and data
+        model = load_model(ticker)
+        X_test, y_test_actual, scaler = load_test_data(ticker)
 
-# ✅ Show Rich Table
-display_results_table(ticker, actual_prices, original_predictions)
+        # Evaluate model
+        results_df, metrics = evaluate_model(model, X_test, y_test_actual, scaler)
 
-# ✅ Plot Predictions vs Actual Prices
-plt.figure(figsize=(12, 6))
-plt.plot(actual_prices, label="Actual Prices", color="green", linestyle="dashed")
-plt.plot(original_predictions, label="Predicted Prices", color="blue")
-plt.title(f"{ticker} Stock Price Prediction vs Actual")
-plt.xlabel("Time")
-plt.ylabel("Stock Price")
-plt.legend()
-plt.show()
+        # Display evaluation metrics
+        print("\nEvaluation Metrics:")
+        for metric, value in metrics.items():
+            print(f"{metric}: {value:.4f}")
+
+        # Display table in terminal
+        display_table(results_df)
+
+        # Save results as a CSV file
+        results_df.to_csv(f"{ticker}_evaluation_results.csv", index=False)
+        print(f"\nResults saved as {ticker}_evaluation_results.csv")
+
+        # Plot results
+        plot_results(results_df, ticker)
+
+    except FileNotFoundError as e:
+        print(f"Error: {e}")

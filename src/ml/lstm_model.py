@@ -13,10 +13,24 @@ import pandas as pd
 import tensorflow as tf
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.layers import LSTM, Bidirectional, Dense, Dropout, Input
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.layers import (
+    LSTM,
+    Bidirectional,
+    Dense,
+    Dropout,
+    Input,
+    LayerNormalization,
+)
 from tensorflow.keras.models import Sequential
 
 # ✅ Set multiprocessing start method for macOS compatibility
@@ -50,7 +64,7 @@ SCALER_PATH = "models/scalers/"
 os.makedirs(MODEL_PATH, exist_ok=True)
 os.makedirs(SCALER_PATH, exist_ok=True)
 
-SEQUENCE_LENGTH = 60
+SEQUENCE_LENGTH = 60  # Adjustable sequence length
 
 
 def signal_handler(sig, frame):
@@ -60,34 +74,6 @@ def signal_handler(sig, frame):
 
 
 signal.signal(signal.SIGINT, signal_handler)
-
-
-def log_message(msg, log_queue):
-    """Thread-safe logging with a multiprocessing queue."""
-    log_queue.put(msg)
-
-
-def process_logs(log_queue):
-    """Handles structured logging from multiple processes cleanly."""
-    console.print("\n[bold cyan]📊 Training Progress:[/bold cyan]\n")
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Ticker", justify="center", style="cyan")
-    table.add_column("Status", justify="center", style="green")
-    table.add_column("Training Time", justify="center", style="yellow")
-    table.add_column("Model Path", justify="left", style="white")
-
-    logs = []
-    while True:
-        msg = log_queue.get()
-        if msg == "STOP":
-            break
-        logs.append(msg)
-
-    for log in logs:
-        ticker, status, elapsed_time, model_path = log.split("|")
-        table.add_row(ticker, status, f"{elapsed_time}s", model_path)
-
-    console.print(table)
 
 
 def get_valid_tickers():
@@ -121,6 +107,18 @@ def prepare_data(df_train, df_test, ticker):
     df_train = df_train.select_dtypes(include=[np.number])
     df_test = df_test.select_dtypes(include=[np.number])
 
+    # ✅ Drop columns that are entirely NaN
+    df_train.dropna(axis=1, how="all", inplace=True)
+    df_test.dropna(axis=1, how="all", inplace=True)
+
+    # ✅ Fill remaining NaNs with median values to avoid errors
+    df_train.fillna(df_train.median(), inplace=True)
+    df_test.fillna(df_test.median(), inplace=True)
+
+    if df_train.isnull().sum().sum() > 0 or df_test.isnull().sum().sum() > 0:
+        logging.warning(f"⚠ {ticker} contains NaN even after imputation! Skipping.")
+        return None, None, None, None
+
     scaler_file = os.path.join(SCALER_PATH, f"{ticker}_scaler.pkl")
 
     if os.path.exists(scaler_file):
@@ -132,6 +130,7 @@ def prepare_data(df_train, df_test, ticker):
         scaler.fit(df_train)
         joblib.dump(scaler, scaler_file)
 
+    # ✅ Ensure test data has the same features as train
     for col in expected_features:
         if col not in df_test.columns:
             df_test[col] = 0  # Fill missing features with zeros
@@ -151,44 +150,73 @@ def prepare_data(df_train, df_test, ticker):
     return create_sequences(df_train.values) + create_sequences(df_test.values)
 
 
-def train_model(ticker, log_queue):
-    """Trains an LSTM model for a given ticker."""
-    start_time = time.time()
-
-    df_train, df_test = load_data(ticker)
-    if df_train is None or df_test is None:
-        log_queue.put(f"{ticker}|❌ No Data|0.00|N/A")
-        return
-
-    X_train, y_train, X_test, y_test = prepare_data(df_train, df_test, ticker)
-    if len(X_train) == 0 or len(X_test) == 0:
-        log_queue.put(f"{ticker}|❌ Insufficient Data|0.00|N/A")
-        return
-
+def build_lstm_model(input_shape):
+    """Builds an optimized LSTM model."""
     model = Sequential(
         [
-            Input(shape=(SEQUENCE_LENGTH, X_train.shape[2])),
-            Bidirectional(LSTM(units=100, return_sequences=True)),
-            Dropout(0.2),
-            Bidirectional(LSTM(units=100, return_sequences=False)),
-            Dropout(0.2),
+            Input(shape=input_shape),
+            LayerNormalization(),
+            Bidirectional(LSTM(units=128, return_sequences=True)),
+            Dropout(0.3),
+            Bidirectional(LSTM(units=128, return_sequences=False)),
+            Dropout(0.3),
             Dense(units=64, activation="relu"),
             Dense(units=1),
         ]
     )
 
     model.compile(optimizer="adam", loss="mean_squared_error")
-    model.fit(X_train, y_train, epochs=50, batch_size=32, verbose=0)
+    return model
 
-    os.makedirs(MODEL_PATH, exist_ok=True)
+
+def train_model(ticker, log_queue):
+    """Trains an LSTM model for a given ticker with clear console logging."""
+    start_time = time.time()
+
+    console.print(f"[bold cyan]🚀 Processing {ticker}...[/bold cyan]")
+
+    df_train, df_test = load_data(ticker)
+    if df_train is None or df_test is None:
+        log_queue.put(f"{ticker}|❌ No Data|0.00|N/A")
+        console.print(f"[red]⚠ No data available for {ticker}. Skipping.[/red]")
+        return
+
+    console.print(f"[bold yellow]🔄 Preprocessing & Scaling {ticker}...[/bold yellow]")
+    X_train, y_train, X_test, y_test = prepare_data(df_train, df_test, ticker)
+    if X_train is None or X_test is None:
+        log_queue.put(f"{ticker}|❌ Insufficient Data|0.00|N/A")
+        console.print(f"[red]⚠ Not enough valid data for {ticker}. Skipping.[/red]")
+        return
+
+    console.print(f"[bold blue]🛠 Building LSTM Model for {ticker}...[/bold blue]")
+    model = build_lstm_model(input_shape=(SEQUENCE_LENGTH, X_train.shape[2]))
+
+    console.print(f"[bold green]🎯 Training LSTM Model for {ticker}...[/bold green]")
+    early_stopping = EarlyStopping(
+        monitor="val_loss", patience=5, restore_best_weights=True
+    )
+    lr_scheduler = ReduceLROnPlateau(
+        monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6
+    )
+
+    model.fit(
+        X_train,
+        y_train,
+        epochs=100,
+        batch_size=32,
+        validation_data=(X_test, y_test),
+        verbose=0,
+        callbacks=[early_stopping, lr_scheduler],
+    )
+
     model_path = os.path.join(MODEL_PATH, f"lstm_{ticker}.h5")
     model.save(model_path)
 
-    elapsed_time = round(time.time() - start_time, 2)
-    log_queue.put(f"{ticker}|✅ Trained & Saved|{elapsed_time}|{model_path}")
+    console.print(f"[bold green]✅ Training Completed for {ticker}![/bold green]")
 
 
-if __name__ == "__main__":
+def main():
+    """Runs the LSTM training pipeline using multiprocessing."""
     tickers = get_valid_tickers()
 
     if len(sys.argv) > 1:
@@ -205,16 +233,11 @@ if __name__ == "__main__":
         f"\n[bold cyan]🚀 Training LSTM models for {len(tickers)} tickers...[/bold cyan]\n"
     )
 
-    manager = Manager()
-    log_queue = manager.Queue()
-
-    log_process = multiprocessing.Process(target=process_logs, args=(log_queue,))
-    log_process.start()
-
     with Pool(min(8, cpu_count())) as pool:
-        pool.starmap(train_model, [(ticker, log_queue) for ticker in tickers])
-
-    log_queue.put("STOP")
-    log_process.join()
+        pool.starmap(train_model, [(ticker, Manager().Queue()) for ticker in tickers])
 
     console.print("\n[bold green]✅ All models trained successfully![/bold green]\n")
+
+
+if __name__ == "__main__":
+    main()

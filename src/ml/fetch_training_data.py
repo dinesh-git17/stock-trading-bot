@@ -6,29 +6,38 @@ import warnings
 from multiprocessing import Pool, cpu_count
 
 import pandas as pd
-import psycopg2
-from alive_progress import alive_bar
 from dotenv import load_dotenv
 from psycopg2 import pool
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 
-# Load environment variables
+# ✅ Load environment variables
 load_dotenv()
 
-# Setup logging
+# ✅ Setup Logging
+LOG_FILE = "data/logs/training_data.log"
+os.makedirs("data/logs", exist_ok=True)
+
 logging.basicConfig(
-    filename="data/logs/training_data.log",
+    filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 console = Console()
 
-# Suppress warnings
+# ✅ Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# Database Configuration
+# ✅ Database Configuration
 DB_CONFIG = {
     "dbname": os.getenv("DB_NAME"),
     "user": os.getenv("DB_USER"),
@@ -37,13 +46,11 @@ DB_CONFIG = {
     "port": os.getenv("DB_PORT"),
 }
 
-# Create a connection pool for efficient DB access
-db_pool = pool.SimpleConnectionPool(
-    1, 10, **DB_CONFIG
-)  # Min 1, Max 10 connections in the pool
+# ✅ Connection Pool
+db_pool = pool.SimpleConnectionPool(1, 10, **DB_CONFIG)  # Min 1, Max 10 connections
 
 
-# Handle Ctrl+C to exit safely
+# ✅ Graceful Exit Handler
 def signal_handler(sig, frame):
     console.print("\n[bold red]❌ Process interrupted. Exiting safely...[/bold red]")
     sys.exit(0)
@@ -81,14 +88,10 @@ def fetch_data(query):
 
 
 def fetch_all_stock_data():
-    """Fetches all stock & technical indicator data in one query."""
+    """Fetches all stock & technical indicator data from materialized views."""
     query = """
-        SELECT s.ticker, s.date, s.open, s.high, s.low, s.close, s.volume, 
-               ti.sma_20, ti.ema_20, ti.rsi_14, ti.macd, ti.macd_signal, 
-               ti.macd_hist, ti.bb_upper, ti.bb_middle, ti.bb_lower
-        FROM stock_analysis_view s
-        LEFT JOIN technical_indicators ti ON s.ticker = ti.ticker AND s.date = ti.date
-        ORDER BY s.ticker, s.date;
+        SELECT * FROM materialized_stock_analysis
+        ORDER BY ticker, date;
     """
     return fetch_data(query)
 
@@ -131,7 +134,9 @@ def merge_data(df_stock, df_sentiment):
 
     df_sentiment["date"] = pd.to_datetime(df_sentiment["published_at"]).dt.date
 
-    df_merged = pd.merge(df_stock, df_sentiment, on="date", how="left").fillna(0)
+    df_merged = pd.merge(df_stock, df_sentiment, on="date", how="left").infer_objects(
+        copy=False
+    )
 
     return df_merged
 
@@ -167,7 +172,7 @@ def save_training_data(args):
 
 def process_training_data():
     """Fetches and processes data for all tickers in parallel with a modern progress bar."""
-    console.print("[bold blue]📊 Fetching all stock & sentiment data...[/bold blue]")
+    console.print("\n[bold blue]📊 Fetching all stock & sentiment data...[/bold blue]")
 
     all_stock_data = fetch_all_stock_data()
     all_sentiment_data = fetch_all_sentiment_data()
@@ -189,25 +194,42 @@ def process_training_data():
 
     args = [(ticker, all_stock_data, all_sentiment_data) for ticker in tickers]
 
-    # Use alive-progress for a more modern progress bar
     results = []
-    with Pool(min(8, cpu_count())) as pool, alive_bar(
-        len(tickers), title="Processing Tickers", bar="smooth"
-    ) as bar:
+    with Pool(min(8, cpu_count())) as pool, Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue] Processing {task.fields[ticker]}..."),
+        BarColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("", total=len(tickers), ticker="Starting...")
+
         for res in pool.imap(save_training_data, args):
             results.append(res)
-            bar()  # Update progress bar
+            progress.update(
+                task, advance=1, ticker=res.split()[1] if "✅" in res else "Skipping..."
+            )
 
     console.print(
         "\n[bold green]✅ All training data processing complete![/bold green]\n"
     )
 
-    # Display summary table
-    table = Table(title="Training Data Processing Summary")
-    table.add_column("Status", justify="center", style="cyan", no_wrap=True)
+    # Display summary table with multiple tickers per row
+    table = Table(
+        title="Training Data Processing Summary", show_lines=True, expand=True
+    )
+    table.add_column(
+        "Processed Tickers", justify="center", style="cyan", overflow="fold"
+    )
 
-    for result in results:
-        table.add_row(result)
+    max_cols = 5  # Number of tickers per row
+    grouped_results = [
+        results[i : i + max_cols] for i in range(0, len(results), max_cols)
+    ]
+
+    for group in grouped_results:
+        table.add_row(" | ".join(group))
 
     console.print(table)
 
