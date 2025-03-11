@@ -7,7 +7,6 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pandas as pd
-import requests
 import yfinance as yf
 from rich.console import Console
 from rich.table import Table

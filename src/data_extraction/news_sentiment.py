@@ -1,15 +1,21 @@
-import json
 import logging
 import os
-import sys
 import time
+from datetime import datetime
 
 import psycopg2
 import requests
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from textblob import TextBlob
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ✅ Load environment variables
 load_dotenv()
@@ -169,17 +175,16 @@ def fetch_stock_news(ticker, max_retries=3):
 ### **🚀 Sentiment Analysis**
 def analyze_sentiment(text):
     """
-    Analyzes sentiment of a news article using TextBlob.
+    Analyzes sentiment of a news article using VADER.
     Returns a polarity score between -1 (negative) to 1 (positive).
     """
-    return round(TextBlob(text).sentiment.polarity, 3)
+    analyzer = SentimentIntensityAnalyzer()
+    return round(analyzer.polarity_scores(text)["compound"], 3)
 
 
 ### **🚀 Store Sentiment Data in Database**
 def store_sentiment_data(cursor, ticker, articles):
-    """
-    Stores news sentiment data in the database using batch insert.
-    """
+    """Stores news sentiment data in the database."""
     sql = """
         INSERT INTO news_sentiment (ticker, published_at, title, sentiment_score)
         VALUES (%s, %s, %s, %s)
@@ -189,7 +194,13 @@ def store_sentiment_data(cursor, ticker, articles):
     records = [
         (
             ticker,
-            article["publishedAt"],
+            (
+                datetime.utcfromtimestamp(article["publishedAt"]).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+                if isinstance(article["publishedAt"], int)
+                else article["publishedAt"]
+            ),
             article["title"],
             analyze_sentiment(article["title"]),
         )
@@ -198,13 +209,14 @@ def store_sentiment_data(cursor, ticker, articles):
 
     if records:
         cursor.executemany(sql, records)
+        return True  # ✅ Indicate that data was stored
+    return False  # ✅ No data stored
 
 
-### **🚀 Process News Sentiment for All Stocks**
+### **🚀 Process News Sentiment for All Stocks with Progress Bar**
 def process_news_sentiment():
     """
-    Fetches news articles, analyzes sentiment, and stores results in the database.
-    Uses multiple news sources to avoid 429 errors.
+    Fetches news articles, analyzes sentiment, and stores results with a modern progress bar.
     """
     conn = psycopg2.connect(
         dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
@@ -215,33 +227,35 @@ def process_news_sentiment():
     tickers = [row[0] for row in cursor.fetchall()]
 
     console.print(
-        f"\n[bold cyan]🚀 Fetching and analyzing news sentiment for {len(tickers)} stocks...[/bold cyan]\n"
+        f"\n🚀 Fetching and analyzing news sentiment for {len(tickers)} stocks...\n",
+        style="bold cyan",
     )
 
     with Progress(
         SpinnerColumn(),
-        TextColumn("[bold yellow]Fetching & analyzing news sentiment...[/bold yellow]"),
+        TextColumn(
+            "[bold blue] Fetching & analyzing news sentiment for {task.fields[ticker]}..."
+        ),
+        BarColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("sentiment", total=len(tickers))
+        task = progress.add_task("", total=len(tickers), ticker="Starting...")
 
         for ticker in tickers:
+            progress.update(
+                task, ticker=ticker
+            )  # Update progress bar with current ticker
             articles = fetch_stock_news(ticker)
-
-            if articles:
-                store_sentiment_data(cursor, ticker, articles)
+            if articles and store_sentiment_data(cursor, ticker, articles):
                 conn.commit()
                 logging.info(f"✅ Stored news sentiment for {ticker}")
+                progress.advance(task)
 
-            time.sleep(1)
-            progress.update(task, advance=1)
-
-    conn.commit()
-    cursor.close()
     conn.close()
-    console.print("[bold green]✅ News sentiment analysis completed![/bold green]")
+    console.print("\n[bold green]✅ News sentiment analysis completed![/bold green]\n")
 
 
-### **🚀 Run the Script**
 if __name__ == "__main__":
     process_news_sentiment()
