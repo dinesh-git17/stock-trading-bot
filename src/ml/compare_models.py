@@ -1,16 +1,5 @@
-import multiprocessing
-import os
-
-# ✅ Fix multiprocessing crash on macOS
-if multiprocessing.get_start_method(allow_none=True) is None:
-    multiprocessing.set_start_method("spawn", force=True)
-
 import logging
-import signal
-import sys
-import warnings
-from datetime import datetime
-from multiprocessing import Pool, cpu_count
+import os
 
 import joblib
 import numpy as np
@@ -18,17 +7,10 @@ import pandas as pd
 import tensorflow as tf
 from dotenv import load_dotenv
 from rich.console import Console
+from rich.progress import track
 from rich.table import Table
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from tensorflow.keras.models import load_model
-from tqdm import tqdm
-
-# ✅ Suppress TensorFlow logs & Metal plugin logs
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = (
-    "0"  # Disable unnecessary TensorFlow optimizations
-)
-tf.get_logger().setLevel("ERROR")
 
 # ✅ Load environment variables
 load_dotenv()
@@ -36,7 +18,6 @@ load_dotenv()
 # ✅ Setup logging
 LOG_FILE = "data/logs/compare_models.log"
 os.makedirs("data/logs", exist_ok=True)
-os.makedirs("data/comparisons", exist_ok=True)
 
 logging.basicConfig(
     filename=LOG_FILE,
@@ -49,121 +30,95 @@ console = Console()
 # ✅ Directory Paths
 PROCESSED_DATA_PATH = "data/processed_data/"
 MODEL_PATH = "models/"
-SCALER_PATH = "models/scalers/"
-SEQUENCE_LENGTH = 60
-
-
-def signal_handler(sig, frame):
-    console.print("\n[bold red]❌ Process interrupted. Exiting safely...[/bold red]")
-    logging.info("Process interrupted by user.")
-    sys.exit(0)
-
-
-signal.signal(signal.SIGINT, signal_handler)
+RESULTS_PATH = "data/comparisons/"
+os.makedirs(RESULTS_PATH, exist_ok=True)
 
 
 def load_test_data(ticker):
-    """Loads test data and scaler, ensuring feature consistency."""
+    """Loads the test data for a given ticker."""
     test_file = os.path.join(PROCESSED_DATA_PATH, f"{ticker}_test.csv")
-    scaler_file = os.path.join(SCALER_PATH, f"{ticker}_scaler.pkl")
 
-    if not os.path.exists(test_file) or not os.path.exists(scaler_file):
-        logging.warning(f"{ticker} - No test data or scaler found. Skipping...")
-        return None, None
+    if not os.path.exists(test_file):
+        console.print(
+            f"[bold red]⚠ No test data found for {ticker}. Skipping...[/bold red]"
+        )
+        return None
 
-    df_test = pd.read_csv(test_file).select_dtypes(include=[np.number])
-    scaler = joblib.load(scaler_file)
-
-    # 🔥 Ensure test data has the same features as training
-    expected_features = scaler.feature_names_in_
-    for col in expected_features:
-        if col not in df_test.columns:
-            df_test[col] = 0  # Fill missing columns with 0s
-    df_test = df_test[expected_features]  # Ensure correct column order
-
-    return df_test, scaler
+    return pd.read_csv(test_file).select_dtypes(include=[np.number])
 
 
-def make_predictions(model, X_test, scaler, feature_columns):
-    """Makes predictions and scales back to original values."""
-    predictions = model.predict(
-        X_test.astype(np.float32), verbose=0
-    )  # ✅ Suppressed output
+def compute_sharpe_ratio(returns, risk_free_rate=0.02):
+    """Computes the Sharpe Ratio for a given model's returns."""
+    excess_returns = returns - risk_free_rate
+    if np.std(excess_returns) == 0:
+        return 0  # Avoid division by zero
+    return np.mean(excess_returns) / np.std(excess_returns)
 
-    predictions_padded = np.hstack(
-        [predictions] + [np.zeros_like(predictions)] * (len(feature_columns) - 1)
-    )
-    predictions_rescaled = scaler.inverse_transform(predictions_padded)[:, 0]
 
-    return predictions_rescaled
+def make_predictions(model, X_test):
+    """Predicts stock prices using a given model."""
+    return model.predict(X_test)
 
 
 def evaluate_predictions(y_true, y_pred):
-    """Computes RMSE."""
-    mse = mean_squared_error(y_true, y_pred)
-    return np.sqrt(mse)
+    """Computes RMSE, MAE, and Sharpe Ratio."""
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    returns = np.diff(y_pred) / y_pred[:-1]  # Simulated returns
+    sharpe_ratio = compute_sharpe_ratio(returns)
+
+    return rmse, mae, sharpe_ratio
 
 
 def compare_models(ticker):
-    """Compares LSTM vs. StockGPT for a given ticker."""
-    logging.info(f"{ticker} - Comparing models...")
-
-    df_test, scaler = load_test_data(ticker)
+    """Compares LSTM, XGBoost, Random Forest, and Hybrid models for a given ticker."""
+    console.print(f"[bold yellow]🔍 Comparing models for {ticker}...[/bold yellow]")
+    df_test = load_test_data(ticker)
     if df_test is None:
         return None
 
-    feature_columns = df_test.columns.tolist()
+    X_test = df_test.drop(columns=["close"])
+    y_test = df_test["close"].values
 
-    # ✅ Ensure model file paths exist
-    lstm_model_path = os.path.join(MODEL_PATH, f"lstm_{ticker}.h5")
-    stock_gpt_model_path = os.path.join(MODEL_PATH, f"stock_gpt_{ticker}.keras")
+    models = {}
+    results = {}
 
-    if not os.path.exists(lstm_model_path) or not os.path.exists(stock_gpt_model_path):
-        logging.warning(f"{ticker} - Models not found. Skipping...")
-        return None
-
-    # ✅ Load LSTM Model
-    lstm_model = load_model(lstm_model_path, compile=False)
-
-    # ✅ Load StockGPT Model (with error handling)
+    # ✅ Load Models
     try:
-        stock_gpt_model = tf.keras.models.load_model(
-            stock_gpt_model_path, compile=False
+        models["LSTM"] = load_model(
+            os.path.join(MODEL_PATH, f"hybrid_lstm_{ticker}.h5")
+        )
+        models["XGBoost"] = joblib.load(
+            os.path.join(MODEL_PATH, f"tuned_xgboost_{ticker}.joblib")
+        )
+        models["RandomForest"] = joblib.load(
+            os.path.join(MODEL_PATH, f"tuned_random_forest_{ticker}.joblib")
+        )
+        models["Hybrid"] = joblib.load(
+            os.path.join(MODEL_PATH, f"hybrid_xgboost_{ticker}.joblib")
         )
     except Exception as e:
-        logging.error(f"{ticker} - Model Loading Failed: {e}")
+        console.print(f"[bold red]⚠ Error loading models for {ticker}: {e}[/bold red]")
         return None
 
-    # ✅ Prepare Test Data
-    X_test = np.array(
-        [
-            df_test.iloc[i - SEQUENCE_LENGTH : i].values
-            for i in range(SEQUENCE_LENGTH, len(df_test))
-        ]
-    )
-    y_test_actual = df_test.iloc[SEQUENCE_LENGTH:]["close"].values
+    # ✅ Evaluate Each Model
+    for model_name, model in models.items():
+        try:
+            y_pred = make_predictions(model, X_test)
+            rmse, mae, sharpe = evaluate_predictions(y_test, y_pred)
+            results[model_name] = {"RMSE": rmse, "MAE": mae, "Sharpe Ratio": sharpe}
+        except Exception as e:
+            console.print(
+                f"[bold red]⚠ Error in {model_name} for {ticker}: {e}[/bold red]"
+            )
 
-    # ✅ Make Predictions
-    lstm_rmse = evaluate_predictions(
-        y_test_actual, make_predictions(lstm_model, X_test, scaler, feature_columns)
-    )
-    stock_gpt_rmse = evaluate_predictions(
-        y_test_actual,
-        make_predictions(stock_gpt_model, X_test, scaler, feature_columns),
-    )
-
-    # ✅ Determine the Better Model
-    better_model = (
-        "LSTM"
-        if lstm_rmse < stock_gpt_rmse
-        else "StockGPT" if stock_gpt_rmse < lstm_rmse else "Tie"
-    )
+    # ✅ Select Best Model (Lowest RMSE)
+    best_model = min(results, key=lambda k: results[k]["RMSE"])
 
     return {
-        "ticker": ticker,
-        "lstm_rmse": lstm_rmse,
-        "stock_gpt_rmse": stock_gpt_rmse,
-        "better_model": better_model,
+        "Ticker": ticker,
+        "Best Model": best_model,
+        **results[best_model],  # Add best model's RMSE, MAE, Sharpe Ratio
     }
 
 
@@ -176,53 +131,21 @@ def compare_all_models():
     ]
 
     console.print(
-        f"[bold cyan]🚀 Comparing StockGPT vs. LSTM for {len(tickers)} tickers...[/bold cyan]"
+        f"[bold cyan]🚀 Comparing models for {len(tickers)} tickers...[/bold cyan]"
     )
-
-    # ✅ Cleaner progress bar (prevents multiple print lines)
     results = []
-    with Pool(min(8, cpu_count())) as pool:
-        for result in tqdm(
-            pool.imap(compare_models, tickers),
-            total=len(tickers),
-            desc="Comparison Progress",
-            dynamic_ncols=True,
-        ):
-            if result:
-                results.append(result)
+
+    for ticker in track(tickers, description="Comparing models..."):
+        result = compare_models(ticker)
+        if result:
+            results.append(result)
 
     results_df = pd.DataFrame(results)
-
-    # ✅ Compute Overall Best Model
-    best_model_counts = results_df["better_model"].value_counts()
-    overall_best = (
-        best_model_counts.idxmax() if not best_model_counts.empty else "No Data"
-    )
-
-    # ✅ Append Overall Result Row
-    results_df = pd.concat(
-        [
-            results_df,
-            pd.DataFrame(
-                [
-                    {
-                        "ticker": "Overall",
-                        "lstm_rmse": "-",
-                        "stock_gpt_rmse": "-",
-                        "better_model": overall_best,
-                    }
-                ]
-            ),
-        ],
-        ignore_index=True,
-    )
-
-    # ✅ Save Results to CSV
-    results_filename = f"data/comparisons/comparison_results_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.csv"
-    results_df.to_csv(results_filename, index=False)
+    results_file = os.path.join(RESULTS_PATH, "comparison_results.csv")
+    results_df.to_csv(results_file, index=False)
 
     console.print(
-        f"[bold green]✅ Model comparison complete! Results saved to {results_filename}[/bold green]"
+        f"[bold green]✅ Model comparison complete! Results saved to {results_file}[/bold green]"
     )
 
 

@@ -1,158 +1,141 @@
-import concurrent.futures
 import logging
-from io import StringIO
-from time import sleep
+import os
+import random
+import shutil
+import time
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import requests
 import yfinance as yf
-from rich.columns import Columns
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
-# Setup logging
+# ✅ Setup Logging
+os.makedirs("data/logs", exist_ok=True)
 logging.basicConfig(
-    filename="data/logs/stock_data.log",
+    filename="data/logs/stock_data_collector.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 console = Console()
-YAHOO_MOST_ACTIVE_URL = "https://finance.yahoo.com/markets/stocks/most-active"
+
+# ✅ Constants
+MOST_ACTIVE_LIMIT = 100
+EXPANDED_LIMIT = 150
+YAHOO_FINANCE_MOST_ACTIVE_URL = "https://finance.yahoo.com/most-active"
+YAHOO_FINANCE_GAINERS_URL = "https://finance.yahoo.com/gainers"
+YAHOO_FINANCE_TRENDING_URL = "https://finance.yahoo.com/trending-tickers"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36"
+}
 
 
-def fetch_most_active_stocks(limit=100):
-    """
-    Fetch at least 'limit' most active stocks from Yahoo Finance.
-    Uses pagination to retrieve data efficiently.
-    Returns a list of valid stock tickers along with company names.
-    """
-    all_stocks = set()  # Use a set to avoid duplicates
-    start = 0  # Pagination start
-
-    console.print("\n")
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold yellow]Fetching most active stocks...[/bold yellow]"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Fetching stocks", total=None)
-
-        try:
-            while len(all_stocks) < limit:
-                url = f"{YAHOO_MOST_ACTIVE_URL}/?start={start}&count=25"
-                response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                response.raise_for_status()
-
-                # Read the table efficiently using lxml
-                tables = pd.read_html(StringIO(response.text), flavor="lxml")
-
-                if not tables:
-                    console.print(
-                        "\n[bold red]No more data available from Yahoo![/bold red]\n"
-                    )
-                    break
-
-                data = tables[0][["Symbol", "Name"]]
-                stocks = {
-                    (row["Symbol"].upper(), row["Name"]) for _, row in data.iterrows()
-                }
-
-                all_stocks.update(stocks)
-                start += 25  # Move to next batch
-
-                # Stop if fewer than 25 new stocks were found (end of data)
-                if len(stocks) < 25:
-                    break
-
-            # Convert set to a list and keep only 'limit' stocks
-            all_stocks = list(all_stocks)[:limit]
-
-            # Validate tickers in parallel
-            valid_stocks = validate_stocks_parallel(all_stocks)
-
-            progress.update(task, advance=1, completed=1, visible=False)
-            console.print(
-                f"[bold green]✅ {len(valid_stocks)} valid stocks fetched![/bold green]\n"
-            )
-
-            logging.info(f"Fetched {len(valid_stocks)} most active stocks.")
-            return valid_stocks
-
-        except Exception as e:
-            console.print(f"\n[bold red]Error fetching stocks:[/bold red] {e}\n")
-            logging.error(f"Error fetching stocks: {e}")
-            return []
+def validate_ticker(ticker):
+    """Checks if a stock ticker is valid by attempting to fetch its 1-day history."""
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="1d")
+        return not df.empty  # ✅ Return True if data exists, False otherwise
+    except Exception:
+        return False
 
 
-def validate_stock(ticker, name):
-    """
-    Validate stock tickers by checking if Yahoo Finance has valid market data.
-    Uses a retry mechanism for reliability.
-    Returns the ticker and name if valid, otherwise None.
-    """
-    stock = yf.Ticker(ticker)
-    retries = 3
+def fetch_stock_list(url, source_name, retries=3):
+    """Fetches stock tickers from Yahoo Finance's most active, gainers, or trending lists."""
     for attempt in range(retries):
         try:
-            # Check multiple possible sources for price data
-            last_price = stock.fast_info.get("last_price")
-            if last_price is None:
-                last_price = stock.history(period="1d").get("Close")
-                if last_price is not None and not last_price.empty:
-                    last_price = last_price.iloc[-1]
+            req = Request(url, headers=HEADERS)
+            response = urlopen(req)
+            tables = pd.read_html(response.read())
 
-            if last_price is not None:
-                return ticker, name
+            if tables and not tables[0].empty:
+                console.print(
+                    f"[bold green]✅ Fetched {source_name} stocks![/bold green]"
+                )
+                return tables[0]["Symbol"].tolist()
+            else:
+                return []
+
+        except HTTPError as e:
+            if e.code == 429:
+                console.print(
+                    f"[bold red]❌ Rate limited! Retrying {source_name} in {2**attempt} seconds...[/bold red]"
+                )
+                time.sleep(2**attempt)  # ✅ Exponential backoff (2s, 4s, 8s)
+            else:
+                logging.error(f"⚠ HTTP Error ({source_name}): {e}")
+                return []
+
         except Exception as e:
-            logging.warning(f"Retry {attempt + 1}/{retries} for {ticker}: {e}")
-            sleep(2)  # Wait before retrying
+            logging.error(f"⚠ Error fetching {source_name}: {e}")
+            return []
 
-    return None  # If all retries fail, consider invalid
+        time.sleep(random.uniform(1, 3))  # ✅ Random delay to prevent detection
 
-
-def validate_stocks_parallel(stocks):
-    """
-    Validate stock tickers in parallel using ThreadPoolExecutor.
-    """
-    valid_stocks = []
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        results = executor.map(lambda s: validate_stock(*s), stocks)
-
-    # Filter out None values
-    valid_stocks = [res for res in results if res is not None]
-
-    return valid_stocks
+    return []
 
 
-def display_stocks(stocks):
-    """
-    Display fetched stock tickers & company names using dynamically formatted tables.
-    """
+def fetch_most_active_stocks():
+    """Fetches the most active, trending, and gainers stocks from Yahoo Finance."""
+    console.print("[bold yellow]📊 Fetching the most active stocks...[/bold yellow]")
 
-    stocks_per_table = 25
-    tables = []
+    # ✅ Fetch stock tickers from multiple sources
+    most_active = fetch_stock_list(YAHOO_FINANCE_MOST_ACTIVE_URL, "Most Active")
+    gainers = fetch_stock_list(YAHOO_FINANCE_GAINERS_URL, "Top Gainers")
+    trending = fetch_stock_list(YAHOO_FINANCE_TRENDING_URL, "Trending Tickers")
 
-    for i in range(0, len(stocks), stocks_per_table):
-        table = Table(
-            title=f"Stocks {i+1}-{min(i+stocks_per_table, len(stocks))}",
-            show_lines=True,
-        )
-        table.add_column("Stock Symbol", justify="center", style="cyan")
-        table.add_column("Company Name", justify="center", style="magenta")
+    # ✅ Combine stock lists and remove duplicates
+    all_stocks = list(
+        dict.fromkeys(most_active + gainers + trending)
+    )  # ✅ Keep order, remove duplicates
 
-        for ticker, name in stocks[i : i + stocks_per_table]:
-            table.add_row(ticker, name)
+    console.print(
+        f"[bold cyan]🔍 Found {len(all_stocks)} unique stock tickers before validation.[/bold cyan]"
+    )
 
-        tables.append(table)
+    # ✅ Validate tickers (ensure they have trade data)
+    valid_stocks = [
+        ticker for ticker in all_stocks[:EXPANDED_LIMIT] if validate_ticker(ticker)
+    ]
 
-    console.print("\n")
-    console.print(Columns(tables, expand=True))
-    console.print("\n")
+    # ✅ Ensure we get at least 100 valid stocks
+    final_stocks = valid_stocks[:MOST_ACTIVE_LIMIT]
+
+    console.print(
+        f"[bold green]✅ {len(final_stocks)} valid stocks fetched![/bold green]"
+    )
+    logging.info(f"✅ {len(final_stocks)} valid stocks fetched.")
+
+    display_active_stocks(final_stocks)
+    return [(ticker,) for ticker in final_stocks]
+
+
+def display_active_stocks(valid_stocks):
+    """Displays the most active stocks in a structured table based on terminal width."""
+    terminal_width = shutil.get_terminal_size((100, 20)).columns
+    max_columns = max(
+        3, terminal_width // 12
+    )  # ✅ Adjust columns based on terminal width
+
+    table = Table(title="Most Active Stocks", show_lines=False)
+    for i in range(max_columns):
+        table.add_column(f"Ticker {i+1}", justify="center", style="bold cyan")
+
+    # ✅ Split tickers into table rows
+    for i in range(0, len(valid_stocks), max_columns):
+        row_tickers = valid_stocks[i : i + max_columns]
+        while len(row_tickers) < max_columns:
+            row_tickers.append("")  # ✅ Fill empty spaces to align columns
+        table.add_row(*row_tickers)
+
+    console.print(table)
 
 
 if __name__ == "__main__":
     most_active_stocks = fetch_most_active_stocks()
-    if most_active_stocks:
-        display_stocks(most_active_stocks)
+    console.print(
+        f"[bold cyan]🎯 Collected {len(most_active_stocks)} most active stocks![/bold cyan]"
+    )

@@ -5,19 +5,26 @@ import psycopg2
 from dotenv import load_dotenv
 from rich.console import Console
 
-# Load environment variables
+# ✅ Load environment variables
 load_dotenv()
 
-# Setup logging
+# ✅ Setup Logging
+LOG_FILE = "data/logs/database_setup.log"
+os.makedirs("data/logs", exist_ok=True)
+
+# ✅ Insert 5 blank lines before logging new logs
+with open(LOG_FILE, "a") as log_file:
+    log_file.write("\n" * 5)
+
 logging.basicConfig(
-    filename="data/logs/database_setup.log",
+    filename=LOG_FILE,
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 console = Console()
 
-# Database Configuration
+# ✅ Database Configuration
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
@@ -25,8 +32,9 @@ DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 
 
+### **🚀 Connect to PostgreSQL Database**
 def connect_db():
-    """Connect to the PostgreSQL database."""
+    """Connects to the PostgreSQL database."""
     try:
         conn = psycopg2.connect(
             dbname=DB_NAME,
@@ -43,10 +51,11 @@ def connect_db():
         return None
 
 
+### **🚀 Update `stock_info` Table**
 def update_stock_info_table(cursor):
-    """Adds missing columns to the stock_info table if they do not exist."""
+    """Ensures `stock_info` table has all required columns."""
     console.print(
-        "[bold yellow]🔄 Checking and updating stock_info table...[/bold yellow]"
+        "[bold yellow]🔄 Checking and updating `stock_info` table...[/bold yellow]"
     )
 
     alter_queries = [
@@ -59,42 +68,50 @@ def update_stock_info_table(cursor):
     for query in alter_queries:
         cursor.execute(query)
 
-    console.print("[bold green]✅ stock_info table updated successfully![/bold green]")
-    logging.info("Updated stock_info table to include missing columns.")
-
-
-def update_technical_indicators_table(cursor):
-    """Ensures technical_indicators table matches the expected schema."""
     console.print(
-        "[bold yellow]🔄 Checking and updating technical_indicators table...[/bold yellow]"
+        "[bold green]✅ `stock_info` table updated successfully![/bold green]"
+    )
+    logging.info("Updated `stock_info` table to include missing columns.")
+
+
+### **🚀 Update `technical_indicators` Table**
+def update_technical_indicators_table(cursor):
+    """Ensures `technical_indicators` table matches the latest schema."""
+    console.print(
+        "[bold yellow]🔄 Checking and updating `technical_indicators` table...[/bold yellow]"
     )
 
-    # Define the correct schema
+    # ✅ Define the schema to support cleaned data structure
     required_columns = {
         "id": "SERIAL PRIMARY KEY",
         "ticker": "VARCHAR(10) NOT NULL",
         "date": "TIMESTAMP NOT NULL",
-        "sma_20": "NUMERIC",
-        "ema_20": "NUMERIC",
+        "sma_50": "NUMERIC",
+        "sma_200": "NUMERIC",
+        "ema_50": "NUMERIC",
+        "ema_200": "NUMERIC",
         "rsi_14": "NUMERIC",
+        "adx_14": "NUMERIC",
+        "atr_14": "NUMERIC",
+        "cci_20": "NUMERIC",
+        "williamsr_14": "NUMERIC",
         "macd": "NUMERIC",
         "macd_signal": "NUMERIC",
         "macd_hist": "NUMERIC",
         "bb_upper": "NUMERIC",
         "bb_middle": "NUMERIC",
         "bb_lower": "NUMERIC",
+        "stoch_k": "NUMERIC",
+        "stoch_d": "NUMERIC",
     }
 
-    # Fetch current columns
+    # ✅ Fetch existing columns
     cursor.execute(
-        """
-        SELECT column_name FROM information_schema.columns 
-        WHERE table_name = 'technical_indicators';
-        """
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'technical_indicators';"
     )
     existing_columns = {row[0] for row in cursor.fetchall()}
 
-    # Add missing columns
+    # ✅ Add missing columns dynamically
     for column, column_type in required_columns.items():
         if column not in existing_columns:
             cursor.execute(
@@ -102,7 +119,7 @@ def update_technical_indicators_table(cursor):
             )
             console.print(f"[bold green]➕ Added column:[/bold green] {column}")
 
-    # Remove extra columns
+    # ✅ Remove extra columns dynamically
     for column in existing_columns:
         if column not in required_columns:
             cursor.execute(
@@ -111,20 +128,21 @@ def update_technical_indicators_table(cursor):
             console.print(f"[bold red]❌ Removed extra column:[/bold red] {column}")
 
     console.print(
-        "[bold green]✅ technical_indicators table is up to date![/bold green]"
+        "[bold green]✅ `technical_indicators` table is up to date![/bold green]"
     )
-    logging.info("Technical indicators table updated successfully.")
+    logging.info("Updated `technical_indicators` table successfully.")
 
 
+### **🚀 Create Tables**
 def create_tables():
-    """Creates necessary tables including stock_info for sector filtering."""
+    """Creates all necessary tables in the PostgreSQL database."""
     conn = connect_db()
     if not conn:
         return
 
     with conn.cursor() as cur:
         try:
-            # Create stocks table (OHLCV data)
+            # ✅ Create `stocks` table (OHLCV data)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS stocks (
@@ -136,36 +154,43 @@ def create_tables():
                     low NUMERIC,
                     close NUMERIC,
                     volume BIGINT,
-                    dividends NUMERIC,
-                    stock_splits NUMERIC,
+                    adjusted_close NUMERIC,
                     UNIQUE (ticker, date)
                 );
             """
             )
 
-            # Create technical indicators table
+            # ✅ Create `technical_indicators` table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS technical_indicators (
                     id SERIAL PRIMARY KEY,
                     ticker VARCHAR(10) NOT NULL,
                     date TIMESTAMP NOT NULL,
-                    sma_20 NUMERIC,
-                    ema_20 NUMERIC,
+                    sma_50 NUMERIC,
+                    sma_200 NUMERIC,
+                    ema_50 NUMERIC,
+                    ema_200 NUMERIC,
                     rsi_14 NUMERIC,
+                    adx_14 NUMERIC,
+                    atr_14 NUMERIC,
+                    cci_20 NUMERIC,
+                    williamsr_14 NUMERIC,
                     macd NUMERIC,
                     macd_signal NUMERIC,
                     macd_hist NUMERIC,
                     bb_upper NUMERIC,
                     bb_middle NUMERIC,
                     bb_lower NUMERIC,
+                    stoch_k NUMERIC,
+                    stoch_d NUMERIC,
                     FOREIGN KEY (ticker, date) REFERENCES stocks (ticker, date) ON DELETE CASCADE,
                     UNIQUE (ticker, date)
                 );
             """
             )
 
-            # ✅ Create stock_info table (stores metadata like sector)
+            # ✅ Create `stock_info` table (stores metadata like sector)
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS stock_info (
@@ -180,7 +205,7 @@ def create_tables():
             """
             )
 
-            # Create news_sentiment table
+            # ✅ Create `news_sentiment` table
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS news_sentiment (
@@ -196,6 +221,7 @@ def create_tables():
 
             update_stock_info_table(cur)
             update_technical_indicators_table(cur)
+
             console.print(
                 "[bold green]✅ Database tables created successfully![/bold green]"
             )
@@ -208,5 +234,6 @@ def create_tables():
     conn.close()
 
 
+### **🚀 Run the Script**
 if __name__ == "__main__":
     create_tables()

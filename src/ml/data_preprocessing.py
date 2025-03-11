@@ -1,20 +1,20 @@
+import concurrent.futures
 import logging
 import os
 import warnings
-from multiprocessing import Pool, cpu_count
 
+import numpy as np
 import pandas as pd
-from alive_progress import alive_bar
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 
-# Load environment variables
+# ✅ Load environment variables
 load_dotenv()
 
-# Setup logging
+# ✅ Setup logging
 logging.basicConfig(
     filename="data/logs/data_preprocessing.log",
     level=logging.INFO,
@@ -23,7 +23,7 @@ logging.basicConfig(
 
 console = Console()
 
-# Directory Paths
+# ✅ Directory Paths
 TRAINING_DATA_PATH = "data/training_data_files/"
 PROCESSED_DATA_PATH = "data/processed_data/"
 os.makedirs(PROCESSED_DATA_PATH, exist_ok=True)
@@ -33,7 +33,7 @@ def load_data(ticker):
     """Loads the training data for a given ticker."""
     file_path = os.path.join(TRAINING_DATA_PATH, f"training_data_{ticker}.csv")
     if not os.path.exists(file_path):
-        logging.warning(f"File not found: {file_path}")
+        logging.warning(f"⚠ File not found: {file_path}")
         return None
 
     df = pd.read_csv(file_path)
@@ -43,64 +43,65 @@ def load_data(ticker):
 
 
 def handle_missing_data(df):
-    """Handles missing values using forward fill and backward fill."""
-    df.ffill(inplace=True)
-    df.bfill(inplace=True)
-    df.dropna(inplace=True)  # Drop rows if any NaNs remain
-    return df if not df.empty else None
+    """Handles missing values using interpolation and fills."""
+    if df.isnull().sum().sum() > 0:
+        df.interpolate(method="linear", inplace=True)
+        df.ffill(inplace=True)
+        df.bfill(inplace=True)
+
+    df.dropna(inplace=True)
+
+    if df.empty:
+        logging.warning("⚠ All data removed after missing value handling!")
+        return None
+
+    return df
 
 
 def feature_engineering(df):
     """Performs feature engineering by adding rolling averages and time-lagged features."""
     df = df.sort_values(by="date")
 
-    # Moving Averages (SMA & EMA)
-    df["sma_50"] = df["close"].rolling(window=50).mean()
-    df["sma_200"] = df["close"].rolling(window=200).mean()
-    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["ema_200"] = df["close"].ewm(span=200, adjust=False).mean()
+    # ✅ Moving Averages (SMA & EMA)
+    df["sma_20"] = df["close"].rolling(window=20, min_periods=1).mean()
+    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
 
-    # Volatility (Rolling Std Deviation)
-    df["volatility"] = df["close"].rolling(window=20).std()
+    # ✅ Volatility (Rolling Std Deviation)
+    df["volatility"] = df["close"].rolling(window=10, min_periods=1).std()
 
-    # Time-Lagged Features (Previous Close Prices)
+    # ✅ Time-Lagged Features (Previous Close Prices)
     for lag in range(1, 6):
         df[f"close_lag_{lag}"] = df["close"].shift(lag)
 
     df.dropna(inplace=True)
-    return df if not df.empty else None
+
+    if df.empty:
+        logging.warning("⚠ Data removed after feature engineering!")
+        return None
+
+    return df
 
 
 def scale_data(df):
-    """Scales numerical features using MinMaxScaler."""
+    """Scales numerical features using StandardScaler."""
     feature_columns = [
         "open",
         "high",
         "low",
         "close",
         "volume",
-        "sma_50",
-        "sma_200",
-        "ema_50",
-        "ema_200",
+        "sma_20",
+        "ema_20",
         "volatility",
-        "rsi_14",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "bb_upper",
-        "bb_middle",
-        "bb_lower",
-        "sentiment_score",
     ] + [f"close_lag_{i}" for i in range(1, 6)]
 
     feature_columns = [col for col in feature_columns if col in df.columns]
 
     if df.empty or len(df) < 1:
-        logging.warning("Skipping MinMaxScaler - No valid data available.")
+        logging.warning("⚠ Skipping StandardScaler - No valid data available.")
         return None
 
-    scaler = MinMaxScaler()
+    scaler = StandardScaler()
     df[feature_columns] = scaler.fit_transform(df[feature_columns])
 
     return df
@@ -109,7 +110,7 @@ def scale_data(df):
 def train_test_split_data(df, ticker):
     """Splits the data into train-test sets and saves them."""
     if df is None or df.empty:
-        logging.warning(f"Skipping {ticker} - No data after preprocessing.")
+        logging.warning(f"⚠ Skipping {ticker} - No data after preprocessing.")
         return
 
     train, test = train_test_split(df, test_size=0.2, shuffle=False)
@@ -117,33 +118,38 @@ def train_test_split_data(df, ticker):
     train.to_csv(os.path.join(PROCESSED_DATA_PATH, f"{ticker}_train.csv"), index=False)
     test.to_csv(os.path.join(PROCESSED_DATA_PATH, f"{ticker}_test.csv"), index=False)
 
-    logging.info(f"Saved train-test data for {ticker}")
+    logging.info(f"✅ Saved train-test data for {ticker}")
 
 
 def process_ticker(ticker):
     """Processes a single ticker: loads, cleans, engineers features, scales, and splits data."""
-    df = load_data(ticker)
-    if df is None:
-        return f"⚠ No data for {ticker}, Skipping."
+    try:
+        df = load_data(ticker)
+        if df is None:
+            return f"⚠ No data for {ticker}, Skipping."
 
-    df = handle_missing_data(df)
-    if df is None:
-        return f"⚠ {ticker} empty after missing data handling."
+        df = handle_missing_data(df)
+        if df is None:
+            return f"⚠ {ticker} empty after missing data handling."
 
-    df = feature_engineering(df)
-    if df is None:
-        return f"⚠ {ticker} empty after feature engineering."
+        df = feature_engineering(df)
+        if df is None:
+            return f"⚠ {ticker} empty after feature engineering."
 
-    df = scale_data(df)
-    if df is None:
-        return f"⚠ {ticker} empty after scaling."
+        df = scale_data(df)
+        if df is None:
+            return f"⚠ {ticker} empty after scaling."
 
-    train_test_split_data(df, ticker)
-    return f"✅ {ticker} processed & saved!"
+        train_test_split_data(df, ticker)
+        return f"✅ {ticker} processed & saved!"
+
+    except Exception as e:
+        logging.error(f"❌ Error processing {ticker}: {str(e)}")
+        return f"❌ {ticker} processing failed!"
 
 
 def process_all_data():
-    """Processes all tickers using parallel processing with a modern progress bar."""
+    """Processes all tickers using parallel processing with structured progress reporting."""
     tickers = [
         f.split("_")[-1].replace(".csv", "")
         for f in os.listdir(TRAINING_DATA_PATH)
@@ -151,20 +157,19 @@ def process_all_data():
     ]
 
     console.print(
-        f"[bold cyan]🚀 Processing {len(tickers)} tickers using {min(8, cpu_count())} cores...[/bold cyan]"
+        f"[bold cyan]🚀 Processing {len(tickers)} tickers using {min(8, os.cpu_count())} threads...[/bold cyan]"
     )
 
     results = []
-    with Pool(min(8, cpu_count())) as pool, alive_bar(
-        len(tickers), title="Processing Tickers", bar="smooth"
-    ) as bar:
-        for res in pool.imap(process_ticker, tickers):
-            results.append(res)
-            bar()  # Update progress bar
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(8, os.cpu_count())
+    ) as executor:
+        for result in executor.map(process_ticker, tickers):
+            results.append(result)
 
     console.print("\n[bold green]✅ All data preprocessing complete![/bold green]\n")
 
-    # Display summary table
+    # ✅ Display summary table
     table = Table(title="Preprocessing Summary")
     table.add_column("Status", justify="center", style="cyan", no_wrap=True)
 
