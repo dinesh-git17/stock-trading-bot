@@ -1,116 +1,100 @@
 import logging
 import os
-import pickle
+import warnings
 
+import numpy as np
 import pandas as pd
-import sqlalchemy
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.theme import Theme
 from sklearn.preprocessing import MinMaxScaler
-from sqlalchemy import create_engine
 
-# ✅ Load environment variables
-load_dotenv()
+from src.tools.utils import save_scaler, setup_logging  # ✅ Corrected import
+
+# ✅ Suppress Warnings
+warnings.simplefilter(action="ignore", category=FutureWarning)
+warnings.simplefilter(action="ignore", category=RuntimeWarning)
 
 # ✅ Setup Logging
-LOG_FILE = "data/logs/data_preprocessing.log"
-os.makedirs("data/logs", exist_ok=True)
+setup_logging("data/logs/data_preprocessing.log")
 
-# ✅ Insert blank lines before logging new logs
-with open(LOG_FILE, "a") as log_file:
-    log_file.write("\n" * 3)
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+# ✅ Custom Theme for Console
+custom_theme = Theme(
+    {
+        "success": "bold green",
+        "info": "bold blue",
+        "warning": "bold yellow",
+        "error": "bold red",
+    }
 )
+console = Console(theme=custom_theme)
 
-console = Console()
+logging.info("Starting data preprocessing...")
 
-# ✅ Database Connection Settings (from .env)
-DB_URI = f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
-engine = create_engine(DB_URI)
-
-# ✅ Directories
-OUTPUT_DIR = "data/transformed"
-SENTIMENT_DIR = "data/sentiment"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(SENTIMENT_DIR, exist_ok=True)
+DATA_DIR = "data/training_data"
+os.makedirs(DATA_DIR, exist_ok=True)  # ✅ Ensure directory exists
 
 
-# ✅ Function to Fetch Sentiment Data
-def fetch_sentiment_data(ticker):
-    """Fetch sentiment scores from PostgreSQL and save them for the given ticker."""
-    logging.info(f"🔍 Fetching sentiment data for {ticker}...")
-    console.print(f"[cyan]🔍 Fetching sentiment data for {ticker}...[/cyan]")
+def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalizes the given DataFrame using MinMaxScaler.
 
-    try:
-        query = """
-            SELECT published_at AS date, sentiment_score
-            FROM news_sentiment
-            WHERE ticker = %s
-            ORDER BY published_at ASC;
-        """
-        df = pd.read_sql(query, engine, params=(ticker,))  # ✅ Pass tuple (ticker,)
+    Args:
+        df (pd.DataFrame): Data to normalize.
 
-        if df.empty:
-            logging.warning(f"⚠️ No sentiment data found for {ticker}. Skipping...")
-            console.print(
-                f"[yellow]⚠️ No sentiment data found for {ticker}. Skipping...[/yellow]"
-            )
-            return None
+    Returns:
+        pd.DataFrame: Normalized data.
+    """
+    logging.info("Applying MinMaxScaler normalization...")
 
-        # ✅ Align sentiment scores by shifting to match stock prices
-        df["sentiment_score"] = df["sentiment_score"].shift(7)
-        df["sentiment_score"] = df["sentiment_score"].bfill()  # ✅ Fixes FutureWarning
-
-        # ✅ Save sentiment data
-        sentiment_path = f"{SENTIMENT_DIR}/sentiment_{ticker}.pkl"
-        with open(sentiment_path, "wb") as f:
-            pickle.dump(df, f)
-
-        logging.info(f"✅ Sentiment data for {ticker} saved at {sentiment_path}")
-        console.print(f"[green]✅ Sentiment data for {ticker} saved.[/green]")
-
-    except Exception as e:
-        logging.error(f"❌ Error fetching sentiment data for {ticker}: {e}")
-        console.print(f"[red]❌ Error fetching sentiment data for {ticker}: {e}[/red]")
-
-
-# ✅ Function to Fetch and Store Sentiment for All Tickers
-def process_all_tickers():
-    """Fetch sentiment data for all tickers in the database."""
-    logging.info("🚀 Fetching sentiment data for all tickers...")
-    console.print(
-        "[bold blue]🚀 Fetching sentiment data for all tickers...[/bold blue]"
-    )
-
-    try:
-        query = "SELECT DISTINCT ticker FROM news_sentiment;"
-        tickers = pd.read_sql(query, engine)["ticker"].tolist()
-    except Exception as e:
-        logging.error(f"❌ Failed to fetch tickers: {e}")
-        console.print(f"[red]❌ Failed to fetch tickers: {e}[/red]")
-        return
-
-    progress = Progress(
-        TextColumn("[bold blue]{task.description}"),
+    with Progress(
+        TextColumn("[info]⏳ Processing:[/]"),
         BarColumn(),
         TimeElapsedColumn(),
         console=console,
-    )
+    ) as progress:
+        task = progress.add_task("Normalizing data...", total=len(df))
 
-    with progress:
-        task = progress.add_task("Processing Sentiment Data...", total=len(tickers))
-        for ticker in tickers:
-            fetch_sentiment_data(ticker)
-            progress.update(task, advance=1)
+        # ✅ Convert NaN values to zero before scaling
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df.fillna(0, inplace=True)  # ✅ Ensure no NaN values remain
 
-    logging.info("✅ Sentiment data fetching complete!")
-    console.print("[bold green]✅ Sentiment data fetching complete![/bold green]")
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        normalized_data = scaler.fit_transform(
+            df.iloc[:, 2:]
+        )  # Normalize numerical columns only
+        save_scaler(scaler)  # ✅ Save scaler for future use
+
+        progress.update(task, advance=len(df))
+
+    logging.info("Normalization complete.")
+    return pd.DataFrame(normalized_data, columns=df.columns[2:])
 
 
-if __name__ == "__main__":
-    process_all_tickers()
+def preprocess_data(df: pd.DataFrame) -> None:
+    """
+    Apply preprocessing steps and save processed data as CSVs.
+
+    Args:
+        df (pd.DataFrame): Raw stock data.
+    """
+    logging.info("Starting preprocessing steps...")
+
+    # ✅ Fix `FutureWarning`: Use `.ffill()` explicitly instead of `method="ffill"`
+    df.iloc[:, 2:] = df.iloc[:, 2:].ffill()
+
+    # ✅ Ensure integer columns remain integers
+    for col in df.select_dtypes(include=["int64"]).columns:
+        df[col] = df[col].astype(int)
+
+    df.iloc[:, 2:] = normalize_data(df)  # ✅ Normalize only numerical columns
+
+    logging.info("Preprocessing complete. Storing CSVs...")
+
+    # ✅ Store preprocessed CSVs per ticker
+    for ticker, ticker_df in df.groupby("ticker"):
+        filepath = os.path.join(DATA_DIR, f"{ticker}.csv")
+        ticker_df.to_csv(filepath, index=False)
+        logging.info(f"✅ Preprocessed data stored for {ticker} -> {filepath}")
+
+    console.print(f"[success]✅ Preprocessed data stored in {DATA_DIR}![/success]")

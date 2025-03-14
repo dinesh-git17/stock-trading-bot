@@ -2,167 +2,88 @@ import logging
 import os
 
 import pandas as pd
-import psycopg2
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
-from sklearn.preprocessing import MinMaxScaler
-from sqlalchemy import create_engine
+from rich.theme import Theme
+from sqlalchemy import text
 
-# ✅ Load environment variables
-load_dotenv()
+from src.ml.data_preprocessing import preprocess_data
+from src.tools.utils import get_database_engine, setup_logging
 
 # ✅ Setup Logging
-LOG_FILE = "data/logs/fetch_training_data.log"
-os.makedirs("data/logs", exist_ok=True)
+setup_logging("data/logs/fetch_training_data.log")
 
-# ✅ Insert blank lines before logging new logs
-with open(LOG_FILE, "a") as log_file:
-    log_file.write("\n" * 3)
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+# ✅ Custom Theme for Console
+custom_theme = Theme(
+    {
+        "success": "bold green",
+        "info": "bold blue",
+        "warning": "bold yellow",
+        "error": "bold red",
+    }
 )
+console = Console(theme=custom_theme)
 
-console = Console()
-
-# ✅ Read database credentials from environment variables
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-
-# ✅ Validate that environment variables are set
-if None in [DB_NAME, DB_USER, DB_PASSWORD, DB_HOST, DB_PORT]:
-    console.print(
-        "[bold red]❌ ERROR:[/bold red] Missing database environment variables.",
-        style="bold red",
-    )
-    exit(1)
-
-# ✅ Output directory for processed training data
-OUTPUT_DIR = "data/training_data"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+logging.info("🚀 Starting fetch_training_data script...")
 
 
-def fetch_data():
-    """Fetches OHLCV stock data from `stocks` and technical indicators from `technical_indicators`."""
-    try:
-        engine = create_engine(
-            f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-        )
-        conn = engine.connect()
+def fetch_training_data(chunksize: int = 5000) -> pd.DataFrame:
+    """
+    Fetches stock market data required for ML model training and passes it to preprocessing.
 
-        # ✅ Query stock OHLCV data from `stocks`
-        stocks_query = """
-        SELECT ticker, date, open, high, low, close, volume, adjusted_close
-        FROM stocks;
-        """
+    Args:
+        chunksize (int): Number of rows per chunk.
 
-        # ✅ Query technical indicators (Using Correct Columns)
-        indicators_query = """
-        SELECT ticker, date, sma_50, sma_200, ema_50, ema_200, rsi_14, adx_14, atr_14, cci_20, williamsr_14, 
-               macd, macd_signal, macd_hist, bb_upper, bb_middle, bb_lower, stoch_k, stoch_d
-        FROM technical_indicators;
-        """
+    Returns:
+        pd.DataFrame: Preprocessed dataset ready for ML models.
+    """
+    logging.info("📡 Connecting to the database...")
+    engine = get_database_engine()
 
-        # ✅ Load data into Pandas DataFrames
-        stocks_df = pd.read_sql(stocks_query, conn)
-        indicators_df = pd.read_sql(indicators_query, conn)
+    console.print("[info]📥 Fetching training data from database...[/info]")
+    logging.info("📥 Fetching training data from database...")
 
-        conn.close()
-        return stocks_df, indicators_df
+    query = """
+    SELECT s.ticker, s.date, s.open, s.high, s.low, s.close, s.volume,
+           ti.sma_50, ti.sma_200, ti.ema_50, ti.ema_200, 
+           ti.macd, ti.macd_signal, ti.macd_hist,
+           ti.bb_upper, ti.bb_middle, ti.bb_lower,
+           ti.rsi_14, ti.adx_14, ti.atr_14, ti.cci_20, ti.williamsr_14, 
+           ti.stoch_k, ti.stoch_d,
+           ns.sentiment_score
+    FROM stocks s
+    LEFT JOIN technical_indicators ti 
+        ON s.ticker = ti.ticker AND s.date = ti.date
+    LEFT JOIN news_sentiment ns 
+        ON s.ticker = ns.ticker AND ns.published_at::DATE = s.date::DATE
+    ORDER BY s.date;
+    """
 
-    except Exception as e:
-        logging.error(f"Database fetch error: {e}")
-        console.print(
-            f"[bold red]❌ ERROR:[/bold red] Failed to fetch data from database.",
-            style="bold red",
-        )
-        return None, None
-
-
-def preprocess_and_save_data(stocks_df, indicators_df):
-    """Processes and saves training data for each ticker separately."""
-
-    # ✅ Merge stock data with technical indicators
-    df = pd.merge(stocks_df, indicators_df, on=["ticker", "date"], how="left")
-
-    # ✅ Convert date to datetime format
-    df["date"] = pd.to_datetime(df["date"])
-
-    # ✅ Sort by ticker and date
-    df = df.sort_values(by=["ticker", "date"])
-
-    # ✅ Handle missing values (FIXED FUTURE WARNING)
-    df = df.ffill().bfill()
-
-    # ✅ Normalize numerical data using MinMaxScaler
-    numeric_cols = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "adjusted_close",
-        "sma_50",
-        "sma_200",
-        "ema_50",
-        "ema_200",
-        "rsi_14",
-        "adx_14",
-        "atr_14",
-        "cci_20",
-        "williamsr_14",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "bb_upper",
-        "bb_middle",
-        "bb_lower",
-        "stoch_k",
-        "stoch_d",
-    ]
-
-    scaler = MinMaxScaler()
-    df[numeric_cols] = scaler.fit_transform(df[numeric_cols])
-
-    # ✅ Get unique tickers
-    tickers = df["ticker"].unique()
-
-    console.print(
-        "\n[bold cyan]📊 Saving processed data for each ticker...[/bold cyan]"
-    )
-
-    # ✅ Rich progress bar for saving files
-    with Progress(
-        TextColumn("[bold blue]⏳ Processing[/bold blue] {task.description}"),
+    with engine.connect() as conn, Progress(
+        TextColumn("[info]⏳ Downloading:[/]"),
         BarColumn(),
         TimeElapsedColumn(),
+        console=console,
     ) as progress:
-        task = progress.add_task("Saving Data...", total=len(tickers))
+        task = progress.add_task("Fetching data...", total=1)
 
-        for ticker in tickers:
-            ticker_df = df[df["ticker"] == ticker]
-
-            # ✅ Save each ticker's data in an industry-level format
-            filename = f"{OUTPUT_DIR}/training_data_{ticker}.csv"
-            ticker_df.to_csv(filename, index=False)
-
-            logging.info(f"Saved processed data for {ticker} -> {filename}")
+        data_chunks = []
+        logging.info("🛠️ Querying database and fetching data in chunks...")
+        for chunk in pd.read_sql_query(text(query), conn, chunksize=chunksize):
+            data_chunks.append(chunk)
             progress.update(task, advance=1)
 
-    console.print("[bold green]✅ Data preprocessing complete![/bold green]")
+    final_data = pd.concat(data_chunks, ignore_index=True)
+    logging.info(f"✅ Data fetching complete. Total rows fetched: {len(final_data)}")
+
+    console.print("[success]✅ Fetching complete! Now preprocessing data...[/success]")
+    logging.info("📊 Sending data for preprocessing...")
+
+    # ✅ Send data directly to preprocessing
+    preprocess_data(final_data)
+
+    logging.info("🏁 Fetching & Preprocessing Complete!")
 
 
 if __name__ == "__main__":
-    console.print("[bold cyan]🚀 Fetching stock data...[/bold cyan]")
-    stocks_df, indicators_df = fetch_data()
-
-    if stocks_df is not None and indicators_df is not None:
-        preprocess_and_save_data(stocks_df, indicators_df)
-    else:
-        console.print("[bold red]❌ Process aborted due to database error.[/bold red]")
+    fetch_training_data()
