@@ -1,218 +1,187 @@
-import concurrent.futures
-import logging
-import os
-import random
-import signal
-import sys
+import datetime
 import time
-from datetime import datetime, timedelta
 
-import psycopg2
+import pandas as pd
 import requests
-from dotenv import load_dotenv
-from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from webdriver_manager.chrome import ChromeDriverManager
 
-# ✅ Load environment variables
-load_dotenv()
+# Initialize Sentiment Analyzer
+analyzer = SentimentIntensityAnalyzer()
 
-# ✅ Setup Logging
-LOG_FILE = "data/logs/historical_news_sentiment.log"
-os.makedirs("data/logs", exist_ok=True)
-
-with open(LOG_FILE, "a") as log_file:
-    log_file.write("\n" * 5)
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
-console = Console()
-
-# ✅ Database Configuration
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-
-# ✅ FMP API Configuration
-FMP_API_KEY = os.getenv("FMP_API_KEY")
-FMP_NEWS_API_URL = "https://financialmodelingprep.com/api/v3/stock_news"
-
-# ✅ Request Rate Limiting
-REQUEST_DELAY = 2  # Base delay for API requests (in seconds)
-MAX_RETRIES = 5  # Maximum retries before skipping a source
-RANDOM_DELAY_RANGE = (1, 3)  # Random delay range to distribute API load
+# Setup Selenium WebDriver
+options = webdriver.ChromeOptions()
+options.add_argument("--headless")  # Run without opening a browser
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+service = Service(ChromeDriverManager().install())
 
 
-# ✅ Graceful Exit Handler
-def handle_exit(signum, frame):
-    console.print("\n[bold red]⚠ Process interrupted! Exiting ...[/bold red]")
-    sys.exit(0)
-
-
-signal.signal(signal.SIGINT, handle_exit)
-signal.signal(signal.SIGTERM, handle_exit)
-
-
-### **🚀 Smart API Request Function with Exponential Backoff**
-def make_request(url, params=None):
-    retries = 0
-    delay = REQUEST_DELAY
-
-    while retries < MAX_RETRIES:
-        try:
-            response = requests.get(url, params=params)
-            if response.status_code == 429:
-                logging.warning(f"⚠ API Rate Limit Hit. Retrying in {delay}s...")
-                time.sleep(delay)
-                delay *= 2  # Exponential backoff
-                retries += 1
-                continue
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logging.error(f"❌ API Request Failed: {e}")
-            retries += 1
-            time.sleep(delay)
-            delay *= 2
-    return None  # Return None after max retries
-
-
-### **🚀 Fetch Historical News from FMP**
-def fetch_fmp_news(ticker, date):
+def fetch_yahoo_finance_news(stock_symbol, start_date, end_date):
     """
-    Fetches historical news headlines from FMP for a given ticker and date.
+    Fetches historical news from Yahoo Finance using Selenium.
     """
-    params = {
-        "apikey": FMP_API_KEY,
-        "tickers": ticker,
-        "limit": 10,  # Adjust based on API limits
-    }
-    data = make_request(FMP_NEWS_API_URL, params=params)
+    base_url = f"https://finance.yahoo.com/quote/{stock_symbol}/news?p={stock_symbol}"
+    news_data = []
 
-    if data:
-        filtered_news = [
-            {"title": article["title"], "publishedAt": article["publishedDate"]}
-            for article in data
-            if article["publishedDate"].startswith(date)
-        ]
-        return filtered_news
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.get(base_url)
+    time.sleep(3)  # Allow page to load
 
-    return []
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    driver.quit()
 
+    articles = soup.find_all("li", class_="js-stream-content")
 
-### **🚀 Sentiment Analysis**
-def analyze_sentiment(text):
-    analyzer = SentimentIntensityAnalyzer()
-    return round(analyzer.polarity_scores(text)["compound"], 3)
-
-
-### **🚀 Check if Sentiment Data Exists (Avoid Duplicates)**
-def sentiment_exists(cursor, ticker, date):
-    """
-    Checks if sentiment data for a given ticker and date already exists in the database.
-    """
-    cursor.execute(
-        "SELECT EXISTS (SELECT 1 FROM news_sentiment WHERE ticker = %s AND published_at::date = %s)",
-        (ticker, date),
-    )
-    return cursor.fetchone()[0]
-
-
-### **🚀 Store Sentiment Data in Database**
-def store_sentiment_data(cursor, ticker, date, articles):
-    """
-    Stores historical news sentiment data in the database.
-    """
-    sql = """
-        INSERT INTO news_sentiment (ticker, published_at, title, sentiment_score)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (ticker, published_at) DO NOTHING;
-    """
-    records = [
-        (
-            ticker,
-            article["publishedAt"],
-            article["title"],
-            analyze_sentiment(article["title"]),
-        )
-        for article in articles
-    ]
-    if records:
-        cursor.executemany(sql, records)
-        return True
-    return False
-
-
-### **🚀 Process Historical Sentiment for a Single Ticker**
-def process_ticker_sentiment(ticker, start_date, end_date, db_params):
-    """
-    Processes historical sentiment for a single ticker.
-    """
-    conn = psycopg2.connect(**db_params)
-    cursor = conn.cursor()
-
-    total_days = (end_date - start_date).days + 1
-    for single_date in (start_date + timedelta(n) for n in range(total_days)):
-        date_str = single_date.date().isoformat()
-
-        if sentiment_exists(cursor, ticker, date_str):
+    for article in articles:
+        headline_tag = article.find("h3")
+        if not headline_tag:
             continue
 
-        articles = fetch_fmp_news(ticker, date_str)
-        if articles and store_sentiment_data(cursor, ticker, date_str, articles):
-            conn.commit()
-            logging.info(f"✅ Stored news sentiment for {ticker} on {date_str}")
+        headline = headline_tag.get_text()
+        link_tag = headline_tag.find("a")
+        link = f"https://finance.yahoo.com{link_tag['href']}" if link_tag else None
+        news_date = datetime.datetime.strptime(start_date, "%Y-%m-%d")  # Approximate
 
-        time.sleep(random.uniform(*RANDOM_DELAY_RANGE))  # Add random delay
+        # Sentiment analysis
+        sentiment = analyzer.polarity_scores(headline)["compound"]
 
-    cursor.close()
-    conn.close()
-    return f"✅ Completed {ticker}"
+        news_data.append(
+            {
+                "date": news_date.strftime("%Y-%m-%d"),
+                "source": "Yahoo Finance",
+                "headline": headline,
+                "sentiment_score": sentiment,
+                "link": link,
+            }
+        )
+
+    return news_data
 
 
-### **🚀 Process All Historical Sentiment in Parallel**
-def process_historical_sentiment():
-    db_params = {
-        "dbname": DB_NAME,
-        "user": DB_USER,
-        "password": DB_PASSWORD,
-        "host": DB_HOST,
-        "port": DB_PORT,
+def fetch_reuters_news(query, start_date, end_date):
+    """
+    Fetches historical news from Reuters by searching their archive.
+    """
+    base_url = f"https://www.reuters.com/site-search/?query={query}&dateRange=pastYear"
+    news_data = []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
     }
 
-    conn = psycopg2.connect(**db_params)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT ticker FROM stocks;")
-    tickers = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
+    response = requests.get(base_url, headers=headers)
+    if response.status_code != 200:
+        print(f"Failed to fetch Reuters news for {query}")
+        return []
 
-    start_date = datetime.strptime("2024-01-01", "%Y-%m-%d")
-    end_date = datetime.today()
+    soup = BeautifulSoup(response.text, "html.parser")
+    articles = soup.find_all("article")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {
-            executor.submit(
-                process_ticker_sentiment, ticker, start_date, end_date, db_params
-            ): ticker
-            for ticker in tickers
-        }
-        for future in concurrent.futures.as_completed(futures):
-            print(futures[future])
+    for article in articles:
+        headline_tag = article.find("h3")
+        if not headline_tag:
+            continue
+
+        headline = headline_tag.get_text()
+        link_tag = article.find("a")
+        link = f"https://www.reuters.com{link_tag['href']}" if link_tag else None
+        date_tag = article.find("time")
+
+        if not date_tag:
+            continue
+
+        news_date = date_tag["datetime"].split("T")[0]
+
+        # Filter by date
+        if start_date <= news_date <= end_date:
+            sentiment = analyzer.polarity_scores(headline)["compound"]
+
+            news_data.append(
+                {
+                    "date": news_date,
+                    "source": "Reuters",
+                    "headline": headline,
+                    "sentiment_score": sentiment,
+                    "link": link,
+                }
+            )
+
+    return news_data
+
+
+def fetch_google_news_rss(query, start_date, end_date):
+    """
+    Uses Google News RSS to get historical news.
+    """
+    base_url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    news_data = []
+
+    response = requests.get(base_url)
+    if response.status_code != 200:
+        print(f"Failed to fetch Google News for {query}")
+        return []
+
+    soup = BeautifulSoup(response.text, "xml")
+    articles = soup.find_all("item")
+
+    for article in articles:
+        headline = article.find("title").text
+        link = article.find("link").text
+        pub_date = article.find("pubDate").text
+
+        # Convert pub_date to YYYY-MM-DD format
+        news_date = datetime.datetime.strptime(
+            pub_date, "%a, %d %b %Y %H:%M:%S GMT"
+        ).strftime("%Y-%m-%d")
+
+        # Filter by date
+        if start_date <= news_date <= end_date:
+            sentiment = analyzer.polarity_scores(headline)["compound"]
+
+            news_data.append(
+                {
+                    "date": news_date,
+                    "source": "Google News",
+                    "headline": headline,
+                    "sentiment_score": sentiment,
+                    "link": link,
+                }
+            )
+
+    return news_data
+
+
+def save_news_data(news_data, filename="historical_news_sentiment.csv"):
+    """
+    Saves collected news data to a CSV file.
+    """
+    df = pd.DataFrame(news_data)
+    df.to_csv(filename, index=False)
+    print(f"Saved {len(df)} news articles to {filename}")
+
+
+def main():
+    stock_symbol = "AAPL"  # Example stock
+    query = "Apple stock"
+    start_date = "2024-01-01"
+    end_date = "2024-03-10"
+
+    print("Fetching Yahoo Finance news...")
+    yahoo_news = fetch_yahoo_finance_news(stock_symbol, start_date, end_date)
+
+    print("Fetching Reuters news...")
+    reuters_news = fetch_reuters_news(query, start_date, end_date)
+
+    print("Fetching Google News RSS...")
+    google_news = fetch_google_news_rss(query, start_date, end_date)
+
+    all_news = yahoo_news + reuters_news + google_news
+    save_news_data(all_news)
 
 
 if __name__ == "__main__":
-    process_historical_sentiment()
+    main()
