@@ -158,9 +158,12 @@ def create_tables():
                     id SERIAL PRIMARY KEY,
                     ticker VARCHAR(10) NOT NULL,
                     published_at TIMESTAMP NOT NULL,
-                    title TEXT,
+                    source_name TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    url TEXT NOT NULL UNIQUE,
                     sentiment_score NUMERIC,
-                    UNIQUE (ticker, published_at)
+                    created_at TIMESTAMP DEFAULT NOW()
                 );
             """
             )

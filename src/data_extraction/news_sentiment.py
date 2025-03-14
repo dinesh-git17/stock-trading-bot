@@ -1,266 +1,243 @@
+import argparse
 import logging
 import os
 import signal
-import sys
+import threading
 import time
-from datetime import datetime
+import traceback
 
-import psycopg2
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# ✅ Load environment variables
+from src.tools.utils import get_database_engine, setup_logging
+
+# ✅ Load environment variables correctly
 load_dotenv()
 
 # ✅ Setup Logging
 LOG_FILE = "data/logs/news_sentiment.log"
-os.makedirs("data/logs", exist_ok=True)
-
-# ✅ Insert 5 blank lines before logging new logs
-with open(LOG_FILE, "a") as log_file:
-    log_file.write("\n" * 5)
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+setup_logging(LOG_FILE)
 
 console = Console()
 
-# ✅ Database Configuration
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
+# ✅ Fix API Key Loading & Splitting
+API_KEYS = os.getenv("NEWS_API_KEY", "").replace(" ", "").split(",")
+
+# ✅ Check if API Keys Are Loaded
+if not API_KEYS or API_KEYS == [""]:
+    console.print("[error]🚨 No API keys found! Check .env file.[/error]")
+    logging.error("🚨 No API keys found! Check .env file.")
+    exit(1)  # ✅ Stop execution if no API keys found
+
+console.print(f"[info]🔑 Loaded API Keys: {', '.join(API_KEYS)}")
+logging.info(f"🔑 Loaded API Keys: {', '.join(API_KEYS)}")
+
+DATA_DIR = "data/raw/news_sentiment/"
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # ✅ API Configuration
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
-STOCKTWITS_API_URL = "https://api.stocktwits.com/api/2/streams/symbol/"
-REDDIT_API_URL = "https://www.reddit.com/r/stocks/search.json"
-TWITTER_API_URL = "https://api.twitter.com/2/tweets/search/recent"
+API_ENDPOINT = "https://newsapi.org/v2/everything"
 
-NEWS_API_URL = "https://newsapi.org/v2/everything"
-FINNHUB_API_URL = "https://finnhub.io/api/v1/news"
-YAHOO_NEWS_API_URL = "https://yahoo-finance15.p.rapidapi.com/api/yahoo/ne/news"
+# ✅ Sentiment Analyzer
+analyzer = SentimentIntensityAnalyzer()
 
-# ✅ Backup Sources List (Fallback Order)
-NEWS_SOURCES = [
-    "newsapi",  # Primary
-    "finnhub",  # Backup 1
-    "yahoo_finance",  # Backup 2
-    "stocktwits",  # Backup 3
-    "reddit",  # Backup 4
-    "twitter",  # Backup 5
-]
+# ✅ Multi-threading & API Settings
+THREADS = 5
+MAX_RETRIES = 3
+RATE_LIMIT_SLEEP = 60  # ✅ Sleep time when hitting API limit
+STOP_EXECUTION = threading.Event()  # ✅ Global exit flag
 
 
-# ✅ Graceful Exit Handler
-def handle_exit(signum, frame):
-    console.print("\n[bold red]⚠ Process interrupted! Exiting ...[/bold red]")
-    sys.exit(0)
+def log_error(exception):
+    """Logs and displays errors in a structured format."""
+    error_message = f"\n🚨 [ERROR] An exception occurred:\n{'-'*50}\n{traceback.format_exc()}{'-'*50}\n"
+    console.print(f"[error]{error_message}[/error]")
+    logging.error(error_message)
 
 
-# ✅ Register signal handlers for clean exit
-signal.signal(signal.SIGINT, handle_exit)  # Handle Ctrl+C
-signal.signal(signal.SIGTERM, handle_exit)  # Handle termination signals
-
-
-### **🚀 Fetch Stock News with Backup Sources**
-def fetch_stock_news(ticker, max_retries=3):
-    """
-    Fetches recent news articles for a stock ticker using multiple sources.
-    Falls back to backup sources if the primary one fails.
-    """
-    for source in NEWS_SOURCES:
-        retries = 0
-        while retries < max_retries:
-            try:
-                if source == "newsapi":
-                    params = {
-                        "q": ticker,
-                        "apiKey": NEWS_API_KEY,
-                        "language": "en",
-                        "sortBy": "publishedAt",
-                        "pageSize": 5,
-                    }
-                    response = requests.get(NEWS_API_URL, params=params)
-
-                elif source == "finnhub":
-                    params = {"category": "general", "token": FINNHUB_API_KEY}
-                    response = requests.get(FINNHUB_API_URL, params=params)
-
-                elif source == "yahoo_finance":
-                    headers = {
-                        "x-rapidapi-host": "yahoo-finance15.p.rapidapi.com",
-                        "x-rapidapi-key": os.getenv("YAHOO_FINANCE_API_KEY"),
-                    }
-                    response = requests.get(YAHOO_NEWS_API_URL, headers=headers)
-
-                elif source == "stocktwits":
-                    response = requests.get(f"{STOCKTWITS_API_URL}{ticker}.json")
-
-                elif source == "reddit":
-                    params = {"q": ticker, "sort": "new", "limit": 5}
-                    headers = {"User-Agent": "stock-sentiment-bot"}
-                    response = requests.get(
-                        REDDIT_API_URL, params=params, headers=headers
-                    )
-
-                elif source == "twitter":
-                    headers = {
-                        "Authorization": f"Bearer {os.getenv('TWITTER_BEARER_TOKEN')}",
-                    }
-                    params = {"query": f"${ticker}", "max_results": 5}
-                    response = requests.get(
-                        TWITTER_API_URL, params=params, headers=headers
-                    )
-
-                # ✅ Handle rate limiting (429 Too Many Requests)
-                if response.status_code == 429:
-                    wait_time = int(response.headers.get("Retry-After", 5))
-                    logging.warning(
-                        f"⚠ Rate limit exceeded for {ticker} using {source}. Retrying in {wait_time}s..."
-                    )
-                    time.sleep(wait_time)
-                    retries += 1
-                    continue  # Retry request
-
-                response.raise_for_status()
-
-                # ✅ Extract articles based on source
-                if source == "newsapi":
-                    return response.json().get("articles", [])
-                elif source == "finnhub":
-                    return [
-                        {"title": news["headline"], "publishedAt": news["datetime"]}
-                        for news in response.json()
-                    ]
-                elif source == "yahoo_finance":
-                    return [
-                        {
-                            "title": news["title"],
-                            "publishedAt": news["providerPublishTime"],
-                        }
-                        for news in response.json()
-                    ]
-                elif source == "stocktwits":
-                    return [
-                        {"title": msg["body"], "publishedAt": msg["created_at"]}
-                        for msg in response.json().get("messages", [])
-                    ]
-                elif source == "reddit":
-                    return [
-                        {
-                            "title": post["data"]["title"],
-                            "publishedAt": post["data"]["created_utc"],
-                        }
-                        for post in response.json()["data"]["children"]
-                    ]
-                elif source == "twitter":
-                    return [
-                        {"title": tweet["text"], "publishedAt": tweet["created_at"]}
-                        for tweet in response.json().get("data", [])
-                    ]
-
-            except requests.exceptions.RequestException as e:
-                logging.error(f"❌ Error fetching news for {ticker} from {source}: {e}")
-
-        logging.warning(
-            f"⚠ Max retries reached for {ticker} using {source}. Skipping..."
-        )
-
-    return []  # Return empty if all sources fail
-
-
-### **🚀 Sentiment Analysis**
-def analyze_sentiment(text):
-    """Analyzes sentiment of a news article using VADER."""
-    analyzer = SentimentIntensityAnalyzer()
-    return round(analyzer.polarity_scores(text)["compound"], 3)
-
-
-### **🚀 Store Sentiment Data in Database**
-def store_sentiment_data(cursor, ticker, articles):
-    """Stores news sentiment data in the database."""
-    sql = """
-        INSERT INTO news_sentiment (ticker, published_at, title, sentiment_score)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (ticker, published_at) DO NOTHING;
-    """
-
-    records = [
-        (
-            ticker,
-            (
-                datetime.utcfromtimestamp(article["publishedAt"]).strftime(
-                    "%Y-%m-%d %H:%M:%S"
-                )
-                if isinstance(article["publishedAt"], int)
-                else article["publishedAt"]
-            ),
-            article["title"],
-            analyze_sentiment(article["title"]),
-        )
-        for article in articles
-    ]
-
-    if records:
-        cursor.executemany(sql, records)
-        return True
-    return False
-
-
-### **🚀 Process News Sentiment**
-def process_news_sentiment():
-    conn = psycopg2.connect(
-        dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, host=DB_HOST, port=DB_PORT
-    )
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT ticker FROM stocks;")
-    tickers = [row[0] for row in cursor.fetchall()]
-
+def handle_exit(signal_received, frame):
+    """Handles keyboard interrupt and stops all processes safely."""
     console.print(
-        f"\n🚀 Fetching and analyzing news sentiment for {len(tickers)} stocks...\n",
-        style="bold cyan",
+        "\n[error]🚨 Process interrupted by user. Stopping all tasks...[/error]"
     )
+    logging.error("🚨 Process interrupted by user. Stopping all tasks...")
+    STOP_EXECUTION.set()  # ✅ Signal all threads to stop immediately
+    exit(0)  # ✅ Force exit safely
+
+
+def analyze_sentiment(text: str) -> float:
+    """Analyzes sentiment of the given text using VADER sentiment analysis.
+
+    Args:
+        text (str): The text (news article title) to analyze.
+
+    Returns:
+        float: Sentiment score between -1 (negative) and 1 (positive).
+    """
+    try:
+        if not text:
+            return 0.0
+        sentiment = analyzer.polarity_scores(text)
+        return sentiment["compound"]  # ✅ Extract compound sentiment score
+    except Exception as e:
+        log_error(e)
+        return 0.0
+
+
+def fetch_news(ticker: str) -> list:
+    """Fetches news articles for a stock ticker with API failover."""
+    try:
+        params = {
+            "q": ticker,
+            "language": "en",
+            "sortBy": "publishedAt",
+            "pageSize": 100,
+        }
+
+        for attempt in range(MAX_RETRIES):
+            for api_key in list(
+                API_KEYS
+            ):  # ✅ Iterate over a copy to allow modification
+                if STOP_EXECUTION.is_set():  # ✅ Stop if exit flag is triggered
+                    return []
+
+                console.print(f"[info]🌍 {ticker}: Using API Key {api_key[:5]}*****")
+                logging.info(f"🌍 {ticker}: Using API Key {api_key[:5]}*****")
+
+                try:
+                    params["apiKey"] = api_key
+                    response = requests.get(API_ENDPOINT, params=params, timeout=10)
+
+                    if response.status_code == 200:
+                        articles = response.json().get("articles", [])
+                        logging.info(
+                            f"✅ {ticker}: {len(articles)} articles fetched using API Key: {api_key[:5]}..."
+                        )
+                        console.print(
+                            f"[success]✅ {ticker}: {len(articles)} articles fetched[/success]"
+                        )
+                        return articles
+
+                except Exception:
+                    log_error(Exception)
+
+    except Exception:
+        log_error(Exception)
+
+    return []
+
+
+def get_tickers_from_db() -> list:
+    """Retrieves stock tickers from the database."""
+    try:
+        engine = get_database_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT DISTINCT ticker FROM stocks")).fetchall()
+        return [row[0] for row in result]
+    except SQLAlchemyError:
+        log_error(SQLAlchemyError)
+        return []
+
+
+def save_to_database(df: pd.DataFrame):
+    """Saves processed sentiment data into the database."""
+    try:
+        engine = get_database_engine()
+        with engine.connect() as conn:
+            df.to_sql("news_sentiment", conn, if_exists="append", index=False)
+        logging.info("✅ Sentiment data stored in database.")
+    except SQLAlchemyError:
+        log_error(SQLAlchemyError)
+
+
+def process_ticker_news(ticker: str) -> pd.DataFrame:
+    """Fetches and analyzes news sentiment for a given ticker."""
+    try:
+        articles = fetch_news(ticker)
+        if not articles:
+            return pd.DataFrame()
+
+        data = []
+        for article in articles:
+            sentiment_score = analyze_sentiment(
+                article.get("title", "")
+            )  # ✅ Now correctly processes sentiment
+            data.append(
+                {
+                    "ticker": ticker,
+                    "published_at": article.get("publishedAt"),
+                    "source_name": (
+                        article["source"]["name"]
+                        if isinstance(article.get("source"), dict)
+                        else None
+                    ),  # ✅ Extract only "name"
+                    "title": article.get("title"),
+                    "description": article.get("description"),
+                    "url": article.get("url"),
+                    "sentiment_score": sentiment_score,
+                }
+            )
+
+        df = pd.DataFrame(data)
+        df["published_at"] = pd.to_datetime(
+            df["published_at"]
+        )  # ✅ Ensure proper timestamp format
+        return df
+    except Exception as e:
+        log_error(e)
+        return pd.DataFrame()
+
+
+def run_news_sentiment_analysis(tickers: list):
+    """Runs the news sentiment analysis pipeline."""
+    console.print("[bold blue]📡 Fetching & Analyzing News Sentiment...[/bold blue]")
 
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue] Processing {task.fields[ticker]}..."),
-            BarColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("", total=len(tickers), ticker="Starting...")
+        article_data = []
+        for ticker in tickers:
+            articles = process_ticker_news(ticker)
+            if not articles.empty:  # ✅ Ensure it's a valid list
+                article_data.append(articles)
 
-            for ticker in tickers:
-                progress.update(task, ticker=ticker)
-                articles = fetch_stock_news(ticker)
-                if articles and store_sentiment_data(cursor, ticker, articles):
-                    conn.commit()
-                    logging.info(f"✅ Stored news sentiment for {ticker}")
-                    progress.advance(task)
+        if not article_data:
+            console.print(
+                "[warning]⚠️ No news sentiment data available for any tickers.[/warning]"
+            )
+            logging.warning("⚠️ No news sentiment data available.")
+            return
+
+        all_data = pd.concat(
+            article_data, ignore_index=True
+        )  # ✅ Concatenate valid data
+        save_to_database(all_data)
+        logging.info("✅ Sentiment analysis complete and data stored.")
+        console.print(
+            "[green]✅ Sentiment Analysis Complete! Data saved in DB.[/green]"
+        )
 
     except KeyboardInterrupt:
         handle_exit(None, None)
 
-    conn.close()
-
 
 if __name__ == "__main__":
-    process_news_sentiment()
+    signal.signal(signal.SIGINT, handle_exit)  # ✅ Register Safe Exit on `Ctrl+C`
+
+    parser = argparse.ArgumentParser(
+        description="Fetch & analyze news sentiment for stocks."
+    )
+    parser.add_argument(
+        "--ticker", type=str, help="Run sentiment analysis for a specific ticker."
+    )
+    args = parser.parse_args()
+
+    if args.ticker:
+        tickers = [args.ticker]
+    else:
+        tickers = get_tickers_from_db()
+
+    run_news_sentiment_analysis(tickers)
