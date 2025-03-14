@@ -1,13 +1,17 @@
 import logging
 import os
 import pickle
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import numpy as np
 import pandas as pd
+import sqlalchemy
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from sklearn.preprocessing import MinMaxScaler
+from sqlalchemy import create_engine
+
+# ✅ Load environment variables
+load_dotenv()
 
 # ✅ Setup Logging
 LOG_FILE = "data/logs/data_preprocessing.log"
@@ -25,152 +29,88 @@ logging.basicConfig(
 
 console = Console()
 
+# ✅ Database Connection Settings (from .env)
+DB_URI = f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+engine = create_engine(DB_URI)
+
 # ✅ Directories
-INPUT_DIR = "data/training_data"
 OUTPUT_DIR = "data/transformed"
-SCALER_DIR = "data/transformed/scalers"  # Store scalers properly
+SENTIMENT_DIR = "data/sentiment"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(SCALER_DIR, exist_ok=True)
-
-# ✅ Configuration
-LOOKBACK_DAYS = 10  # Number of past days used as features
-NUM_WORKERS = min(4, os.cpu_count())  # Use max 4 cores to prevent overloading
+os.makedirs(SENTIMENT_DIR, exist_ok=True)
 
 
-def load_data(ticker):
-    """Loads preprocessed stock data for a given ticker."""
-    file_path = f"{INPUT_DIR}/training_data_{ticker}.csv"
+# ✅ Function to Fetch Sentiment Data
+def fetch_sentiment_data(ticker):
+    """Fetch sentiment scores from PostgreSQL and save them for the given ticker."""
+    logging.info(f"🔍 Fetching sentiment data for {ticker}...")
+    console.print(f"[cyan]🔍 Fetching sentiment data for {ticker}...[/cyan]")
 
-    if not os.path.exists(file_path):
-        logging.warning(f"⚠️ No data found for {ticker}. Skipping...")
-        return None
+    try:
+        query = """
+            SELECT published_at AS date, sentiment_score
+            FROM news_sentiment
+            WHERE ticker = %s
+            ORDER BY published_at ASC;
+        """
+        df = pd.read_sql(query, engine, params=(ticker,))  # ✅ Pass tuple (ticker,)
 
-    return pd.read_csv(file_path)
+        if df.empty:
+            logging.warning(f"⚠️ No sentiment data found for {ticker}. Skipping...")
+            console.print(
+                f"[yellow]⚠️ No sentiment data found for {ticker}. Skipping...[/yellow]"
+            )
+            return None
 
+        # ✅ Align sentiment scores by shifting to match stock prices
+        df["sentiment_score"] = df["sentiment_score"].shift(7)
+        df["sentiment_score"] = df["sentiment_score"].bfill()  # ✅ Fixes FutureWarning
 
-def transform_data(df):
-    """Prepares data for LSTM model by creating lag features and normalizing."""
+        # ✅ Save sentiment data
+        sentiment_path = f"{SENTIMENT_DIR}/sentiment_{ticker}.pkl"
+        with open(sentiment_path, "wb") as f:
+            pickle.dump(df, f)
 
-    # ✅ Ensure date is in datetime format & sort
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values(by="date")
+        logging.info(f"✅ Sentiment data for {ticker} saved at {sentiment_path}")
+        console.print(f"[green]✅ Sentiment data for {ticker} saved.[/green]")
 
-    # ✅ Create Target Column (Next Day's Closing Price)
-    df["next_close"] = df["close"].shift(-1)
-    df.dropna(inplace=True)  # Remove last row with NaN target
-
-    # ✅ Select Features
-    features = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "adjusted_close",
-        "sma_50",
-        "sma_200",
-        "ema_50",
-        "ema_200",
-        "rsi_14",
-        "adx_14",
-        "atr_14",
-        "cci_20",
-        "williamsr_14",
-        "macd",
-        "macd_signal",
-        "macd_hist",
-        "bb_upper",
-        "bb_middle",
-        "bb_lower",
-        "stoch_k",
-        "stoch_d",
-    ]
-
-    # ✅ Normalize Data
-    scaler = MinMaxScaler()
-    df[features] = scaler.fit_transform(df[features])
-
-    # ✅ Create Lag Features (Time-Series Window)
-    X, Y = [], []
-    for i in range(len(df) - LOOKBACK_DAYS):
-        X.append(
-            df[features].iloc[i : i + LOOKBACK_DAYS].values
-        )  # Past LOOKBACK_DAYS data
-        Y.append(df["next_close"].iloc[i + LOOKBACK_DAYS])  # Next closing price
-
-    X, Y = np.array(X), np.array(Y)  # Convert to numpy arrays
-
-    return X, Y, scaler
+    except Exception as e:
+        logging.error(f"❌ Error fetching sentiment data for {ticker}: {e}")
+        console.print(f"[red]❌ Error fetching sentiment data for {ticker}: {e}[/red]")
 
 
-def save_transformed_data(ticker, X, Y, scaler):
-    """Saves transformed dataset & scaler for each ticker."""
-    output_file = f"{OUTPUT_DIR}/transformed_{ticker}.pkl"
-    scaler_file = f"{SCALER_DIR}/scaler_{ticker}.pkl"
+# ✅ Function to Fetch and Store Sentiment for All Tickers
+def process_all_tickers():
+    """Fetch sentiment data for all tickers in the database."""
+    logging.info("🚀 Fetching sentiment data for all tickers...")
+    console.print(
+        "[bold blue]🚀 Fetching sentiment data for all tickers...[/bold blue]"
+    )
 
-    with open(output_file, "wb") as f:
-        pickle.dump((X, Y), f)
+    try:
+        query = "SELECT DISTINCT ticker FROM news_sentiment;"
+        tickers = pd.read_sql(query, engine)["ticker"].tolist()
+    except Exception as e:
+        logging.error(f"❌ Failed to fetch tickers: {e}")
+        console.print(f"[red]❌ Failed to fetch tickers: {e}[/red]")
+        return
 
-    with open(scaler_file, "wb") as f:
-        pickle.dump(scaler, f)
+    progress = Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    )
 
-    logging.info(f"✅ Transformed data saved for {ticker}: {output_file}")
+    with progress:
+        task = progress.add_task("Processing Sentiment Data...", total=len(tickers))
+        for ticker in tickers:
+            fetch_sentiment_data(ticker)
+            progress.update(task, advance=1)
 
-
-def process_ticker(ticker):
-    """Processes a single ticker: Loads, Transforms, and Saves."""
-    df = load_data(ticker)
-    if df is None:
-        return ticker, False  # Indicate failure
-
-    X, Y, scaler = transform_data(df)
-    save_transformed_data(ticker, X, Y, scaler)
-
-    return ticker, True  # Indicate success
+    logging.info("✅ Sentiment data fetching complete!")
+    console.print("[bold green]✅ Sentiment data fetching complete![/bold green]")
 
 
 if __name__ == "__main__":
-    console.print(
-        "[bold cyan]🚀 Processing stock data for LSTM training using multiprocessing...[/bold cyan]"
-    )
-
-    tickers = [
-        f.split("_")[-1].split(".")[0]
-        for f in os.listdir(INPUT_DIR)
-        if f.startswith("training_data_")
-    ]
-
-    # ✅ Rich Progress Bar for Processing (Ensuring It Prints Only Once)
-    with Progress(
-        TextColumn("[bold blue]⏳ Transforming Data:[/bold blue] {task.description}"),
-        BarColumn(),
-        TimeElapsedColumn(),
-    ) as progress:
-        task = progress.add_task("Processing Tickers...", total=len(tickers))
-
-        # ✅ Use multiprocessing to process tickers in parallel
-        results = []
-        with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-            future_to_ticker = {
-                executor.submit(process_ticker, ticker): ticker for ticker in tickers
-            }
-
-            for future in as_completed(future_to_ticker):
-                ticker, success = future.result()
-                results.append((ticker, success))
-                progress.update(
-                    task, advance=1
-                )  # ✅ Updates bar dynamically WITHOUT multiple prints
-
-    # ✅ Print all success/failure messages AFTER the progress bar is complete
-    for ticker, success in results:
-        if success:
-            console.print(
-                f"[bold green]✅ Saved transformed data for {ticker}[/bold green]"
-            )
-        else:
-            console.print(f"[bold red]⚠️ Skipped {ticker} (No Data)[/bold red]")
-
-    console.print(
-        "\n[bold green]✅ Data transformation complete! All tickers processed successfully.[/bold green]\n"
-    )
+    process_all_tickers()
