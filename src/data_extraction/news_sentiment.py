@@ -20,6 +20,17 @@ from yahoo_fin import news
 
 from src.tools.utils import get_database_engine, setup_logging
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("data/logs/news_sentiment.log"),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
 # ✅ Load environment variables correctly
 load_dotenv()
 
@@ -46,6 +57,7 @@ STOP_EXECUTION = threading.Event()  # ✅ Global exit flag
 
 
 def log_error(exception, custom_message=""):
+    logger.info("Entering function: log_error")
     """Logs and displays errors in a structured Rich Box with debug tips."""
     error_message = (
         f"\n🚨 [ERROR] {custom_message}\n{'-'*50}\n{traceback.format_exc()}{'-'*50}\n"
@@ -63,6 +75,7 @@ def log_error(exception, custom_message=""):
 
 
 def handle_exit(signal_received, frame):
+    logger.info("Entering function: handle_exit")
     """Handles keyboard interrupt and stops all processes safely."""
     console.print(
         Panel("🚨 Process interrupted by user. Stopping all tasks...", style="bold red")
@@ -73,6 +86,7 @@ def handle_exit(signal_received, frame):
 
 
 def fetch_all_tickers():
+    logger.info("Entering function: fetch_all_tickers")
     """Fetches all distinct tickers from the `stocks` table."""
     try:
         engine = get_database_engine()
@@ -81,13 +95,17 @@ def fetch_all_tickers():
             result = conn.execute(query).fetchall()
         tickers = [row[0] for row in result]
         logging.info(f"✅ Retrieved {len(tickers)} tickers from database.")
+        logger.info("Exiting function: fetch_all_tickers")
         return tickers
     except SQLAlchemyError as e:
+        logger.error("An error occurred", exc_info=True)
         log_error(e, "Error fetching tickers from database.")
+        logger.info("Exiting function: fetch_all_tickers")
         return []
 
 
 def fetch_news_from_newsapi(ticker: str) -> pd.DataFrame:
+    logger.info("Entering function: fetch_news_from_newsapi")
     """Fetches news articles for a stock ticker from NewsAPI and returns a DataFrame."""
     try:
         console.print(
@@ -112,12 +130,14 @@ def fetch_news_from_newsapi(ticker: str) -> pd.DataFrame:
             return pd.DataFrame(articles)
 
     except Exception as e:
+        logger.error("An error occurred", exc_info=True)
         log_error(e, f"Failed to fetch data from NewsAPI for {ticker}")
 
     return pd.DataFrame()
 
 
 def fetch_news_from_google_rss(ticker: str) -> pd.DataFrame:
+    logger.info("Entering function: fetch_news_from_google_rss")
     """Fetches stock news from Google News RSS feeds and returns a properly formatted DataFrame."""
     try:
         console.print(
@@ -130,9 +150,9 @@ def fetch_news_from_google_rss(ticker: str) -> pd.DataFrame:
         for entry in feed.entries:
             title = entry.get("title", "")
             description = entry.get("summary", "")
-            sentiment_score = analyzer.polarity_scores(title + " " + description)[
-                "compound"
-            ]
+            sentiment_score = analyzer.polarity_scores(
+                str(title) + " " + str(description)
+            )["compound"]
 
             articles.append(
                 {
@@ -157,12 +177,14 @@ def fetch_news_from_google_rss(ticker: str) -> pd.DataFrame:
         return pd.DataFrame(articles)
 
     except Exception as e:
+        logger.error("An error occurred", exc_info=True)
         log_error(e, f"Failed to fetch Google News RSS for {ticker}")
 
     return pd.DataFrame()
 
 
 def fetch_news_from_yahoo(ticker: str) -> pd.DataFrame:
+    logger.info("Entering function: fetch_news_from_yahoo")
     """Fetches financial news for a stock ticker from Yahoo Finance and returns a DataFrame."""
     try:
         console.print(
@@ -172,15 +194,18 @@ def fetch_news_from_yahoo(ticker: str) -> pd.DataFrame:
         console.print(
             f"[green]✅ Yahoo Finance: {len(articles)} articles fetched.[/green]"
         )
+        logger.info("Exiting function: fetch_news_from_yahoo")
         return pd.DataFrame(articles)
 
     except Exception as e:
+        logger.error("An error occurred", exc_info=True)
         log_error(e, f"Failed to fetch Yahoo Finance news for {ticker}")
 
     return pd.DataFrame()
 
 
 def fetch_news_from_reddit(ticker: str) -> pd.DataFrame:
+    logger.info("Entering function: fetch_news_from_reddit")
     """Fetches discussions from Reddit finance forums and returns a DataFrame."""
     try:
         console.print(
@@ -209,6 +234,7 @@ def fetch_news_from_reddit(ticker: str) -> pd.DataFrame:
         return pd.DataFrame(articles)
 
     except Exception as e:
+        logger.error("An error occurred", exc_info=True)
         log_error(e, f"Failed to fetch Reddit discussions for {ticker}")
 
     return pd.DataFrame()
@@ -289,6 +315,7 @@ if __name__ == "__main__":
                         ).fetchall()
                     )
             except Exception as e:
+                logger.error("An error occurred", exc_info=True)
                 log_error(e, "Error fetching existing URLs from database.")
                 existing_urls = set()
 
@@ -312,4 +339,5 @@ if __name__ == "__main__":
                 )
 
     except Exception as e:
+        logger.error("An error occurred", exc_info=True)
         log_error(e, "Unexpected error in the main execution.")
