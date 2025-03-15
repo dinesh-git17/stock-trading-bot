@@ -1,10 +1,12 @@
 import argparse
 import logging
 import os
+import re
 import signal
 import threading
 import time
 import traceback
+from datetime import datetime
 
 import feedparser
 import pandas as pd
@@ -204,9 +206,60 @@ def fetch_news_from_yahoo(ticker: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+# ✅ List of invalid words that should never be considered stock tickers
+INVALID_TICKERS = {
+    "ETF",
+    "USD",
+    "AI",
+    "FTC",
+    "AH",
+    "US",
+    "DOJ",
+    "TSMC",
+    "CEO",
+    "IPO",
+    "CPI",
+    "I",
+    "ITM",
+}
+
+
+def extract_ticker_from_title(title: str, default_ticker: str) -> str:
+    """
+    Extracts the stock ticker from a Reddit post title using regex.
+    Ensures only valid stock tickers (1-5 uppercase letters) are extracted.
+    Excludes common words that are not stock tickers.
+    """
+    # ✅ Use a stricter regex to match 2-5 uppercase letters (avoiding single letters)
+    match = re.findall(r"\b[A-Z]{2,5}\b", title)
+
+    # ✅ Remove words that are not actual stock tickers
+    valid_tickers = [word for word in match if word not in INVALID_TICKERS]
+
+    return (
+        valid_tickers[0] if valid_tickers else default_ticker
+    )  # Use first valid match or default ticker
+
+
+def analyze_sentiment(text: str) -> float:
+    """
+    Analyzes sentiment of a given text using VADER Sentiment Analysis.
+    Returns a sentiment score between -1 (negative) and 1 (positive).
+    """
+    analyzer = SentimentIntensityAnalyzer()
+    sentiment_score = analyzer.polarity_scores(text)["compound"]
+    return sentiment_score
+
+
 def fetch_news_from_reddit(ticker: str) -> pd.DataFrame:
+    """
+    Fetches discussions from Reddit finance forums and returns a DataFrame.
+    Extracts the stock ticker from the post title if available.
+    Ensures `published_at` is never NULL by assigning a default timestamp if missing.
+    Calculates sentiment score for each post and sets `source_name = "Reddit"`.
+    Ensures all required columns exist before inserting into the database.
+    """
     logger.info("Entering function: fetch_news_from_reddit")
-    """Fetches discussions from Reddit finance forums and returns a DataFrame."""
     try:
         console.print(
             f"[bold blue]🌍 Fetching Reddit discussions for {ticker}...[/bold blue]"
@@ -220,24 +273,95 @@ def fetch_news_from_reddit(ticker: str) -> pd.DataFrame:
         subreddit = reddit.subreddit("stocks")
         posts = subreddit.search(f"{ticker}", sort="new", limit=10)
 
-        articles = [
-            {
-                "title": post.title,
-                "url": post.url,
-                "publishedAt": time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(post.created_utc)
-                ),
-            }
-            for post in posts
+        articles = []
+        missing_ticker_count = 0
+        missing_date_count = 0
+
+        for post in posts:
+            extracted_ticker = extract_ticker_from_title(post.title, ticker)
+            if not extracted_ticker:
+                missing_ticker_count += 1
+
+            # Ensure `published_at` is properly assigned
+            if post.created_utc:
+                published_at = datetime.utcfromtimestamp(post.created_utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+            else:
+                published_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+                missing_date_count += 1
+
+            # **Calculate Sentiment Score**
+            sentiment_score = analyze_sentiment(post.title)
+
+            articles.append(
+                {
+                    "ticker": extracted_ticker,
+                    "published_at": published_at,  # Ensure NOT NULL
+                    "source_name": "Reddit",  # Set source name
+                    "title": post.title,
+                    "description": None,  # Reddit posts don't have a description
+                    "url": post.url,
+                    "sentiment_score": sentiment_score,  # Store Sentiment Score
+                    "created_at": datetime.utcnow().strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),  # Timestamp for data insertion
+                }
+            )
+
+        if missing_ticker_count > 0:
+            logger.warning(
+                f"⚠️ {missing_ticker_count} articles missing a ticker. Default `{ticker}` used."
+            )
+
+        if missing_date_count > 0:
+            logger.warning(
+                f"⚠️ {missing_date_count} articles missing `published_at`. Default timestamp assigned."
+            )
+
+        # Convert to DataFrame
+        df = pd.DataFrame(articles)
+
+        # **Ensure No NULL Published Dates (Fixed Chained Assignment)**
+        df["published_at"] = df["published_at"].fillna(
+            datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+
+        # **Ensure all required columns exist before inserting into database**
+        required_columns = [
+            "ticker",
+            "published_at",
+            "source_name",
+            "title",
+            "description",
+            "url",
+            "sentiment_score",
+            "created_at",
         ]
-        console.print(f"[green]✅ Reddit: {len(articles)} posts fetched.[/green]")
-        return pd.DataFrame(articles)
+        for col in required_columns:
+            if col not in df.columns:
+                df[col] = None  # Add missing columns with None values
+
+        console.print(f"[green]✅ Reddit: {len(df)} posts fetched.[/green]")
+
+        return df
 
     except Exception as e:
         logger.error("An error occurred", exc_info=True)
         log_error(e, f"Failed to fetch Reddit discussions for {ticker}")
 
-    return pd.DataFrame()
+    return pd.DataFrame(
+        columns=[
+            "ticker",
+            "published_at",
+            "source_name",
+            "title",
+            "description",
+            "url",
+            "sentiment_score",
+            "created_at",
+        ]
+    )
 
 
 if __name__ == "__main__":
@@ -275,8 +399,7 @@ if __name__ == "__main__":
         all_data = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
         # ✅ Filtering only required columns before inserting into the database
-        # ✅ Filtering only required columns before inserting into the database
-        # ✅ Step 1: Validate and filter rows before inserting into the database
+
         if not all_data.empty:
             engine = get_database_engine()
 
@@ -324,15 +447,30 @@ if __name__ == "__main__":
 
             # ✅ Step 5: Insert into the database only if there are valid rows
             if not all_data.empty:
-                all_data.to_sql(
-                    "news_sentiment", engine, if_exists="append", index=False
-                )
-                console.print(
-                    Panel(
-                        "[green]✅ Sentiment Analysis Complete! Data saved in DB.[/green]",
-                        style="bold green",
-                    )
-                )
+                required_columns = [
+                    "ticker",
+                    "published_at",
+                    "source_name",
+                    "title",
+                    "description",
+                    "url",
+                    "sentiment_score",
+                    "created_at",
+                ]
+                for col in required_columns:
+                    if col not in all_data.columns:
+                        all_data[col] = (
+                            None  # Ensure missing columns are created with None values
+                        )
+                        all_data.to_sql(
+                            "news_sentiment", engine, if_exists="append", index=False
+                        )
+                        console.print(
+                            Panel(
+                                "[green]✅ Sentiment Analysis Complete! Data saved in DB.[/green]",
+                                style="bold green",
+                            )
+                        )
             else:
                 console.print(
                     "[yellow]⚠️ No new valid data to insert. Skipping database update.[/yellow]"
