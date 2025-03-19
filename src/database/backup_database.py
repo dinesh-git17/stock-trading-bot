@@ -7,55 +7,69 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-# Load environment variables
+from src.tools.utils import handle_exceptions, setup_logging
+
+# ✅ Load environment variables
 load_dotenv()
 
-# Setup logging
-logging.basicConfig(
-    filename="data/logs/database_backup.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+# ✅ Setup Logging
+LOG_FILE = "data/logs/database_backup.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+setup_logging(LOG_FILE)
+logger = logging.getLogger(__name__)
 
+# ✅ Setup Console
 console = Console()
 
-# Database Configuration
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-
-# Backup Directory
+# ✅ Backup Directory
 BACKUP_DIR = "data/backups/"
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 
+@handle_exceptions
 def backup_database():
     """
-    Creates a PostgreSQL database backup and stores it in the backup directory.
+    Creates a compressed PostgreSQL database backup and stores it in the backup directory.
     """
     console.print("\n[bold yellow]🔄 Creating database backup...[/bold yellow]")
 
+    db_name = os.getenv("DB_NAME")
+    db_user = os.getenv("DB_USER")
+    db_password = os.getenv("DB_PASSWORD")
+    db_host = os.getenv("DB_HOST")
+    db_port = os.getenv("DB_PORT")
+
+    if not all([db_name, db_user, db_password, db_host, db_port]):
+        console.print(
+            "[bold red]❌ Missing database credentials in .env file![/bold red]"
+        )
+        logger.error("Database backup failed: Missing credentials in .env file.")
+        return
+
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    backup_file = os.path.join(BACKUP_DIR, f"backup_{timestamp}.sql")
+    backup_file = os.path.join(BACKUP_DIR, f"backup_{timestamp}.sql.gz")
 
     env = os.environ.copy()
-    env["PGPASSWORD"] = DB_PASSWORD  # Pass password securely
+    if db_password is None:
+        console.print("[bold red]❌ Missing database password in .env file![/bold red]")
+        logger.error("Database backup failed: Missing database password in .env file.")
+        return
+
+    env["PGPASSWORD"] = db_password
 
     command = [
         "pg_dump",
         "-h",
-        DB_HOST,
+        db_host,
         "-p",
-        DB_PORT,
+        db_port,
         "-U",
-        DB_USER,
+        db_user,
         "-F",
-        "c",  # Custom format for better compression
+        "c",  # ✅ Custom format for better compression
         "-f",
-        backup_file,
-        DB_NAME,
+        "-",  # ✅ Output to stdout for piping
+        db_name,
     ]
 
     try:
@@ -65,17 +79,24 @@ def backup_database():
             console=console,
         ) as progress:
             task = progress.add_task("backup", total=None)
-            subprocess.run(command, check=True, env=env)
+
+            # ✅ Run backup and compress output using gzip
+            with open(backup_file, "wb") as f:
+                subprocess.run(command, check=True, env=env, stdout=subprocess.PIPE)
+                subprocess.run(
+                    ["gzip"], check=True, env=env, stdin=subprocess.PIPE, stdout=f
+                )
+
             progress.update(task, completed=1)
 
         console.print(
             f"[bold green]✅ Backup created successfully: {backup_file}[/bold green]"
         )
-        logging.info(f"Backup created: {backup_file}")
+        logger.info(f"Backup created: {backup_file}")
 
     except subprocess.CalledProcessError as e:
         console.print(f"[bold red]❌ Backup failed:[/bold red] {e}")
-        logging.error(f"Backup failed: {e}")
+        logger.error(f"Backup failed: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

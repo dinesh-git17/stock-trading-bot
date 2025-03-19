@@ -1,12 +1,8 @@
 import logging
 import os
-import signal
-import sys
 import time
 
-import psycopg2
 import yfinance as yf
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -16,58 +12,27 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from sqlalchemy import text
 
-# ✅ Load environment variables
-load_dotenv()
+# ✅ Import utilities
+from src.tools.utils import get_database_engine, handle_exceptions, setup_logging
 
 # ✅ Setup Logging
 LOG_FILE = "data/logs/populate_stock_info.log"
-os.makedirs("data/logs", exist_ok=True)
-
-# ✅ Insert 5 blank lines before logging new logs
-with open(LOG_FILE, "a") as log_file:
-    log_file.write("\n" * 5)
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+setup_logging(LOG_FILE)
+logger = logging.getLogger(__name__)
 console = Console()
-
-# ✅ Database Configuration
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
+logger.info("🚀 Logging setup complete.")
 
 
-def connect_db():
-    """Connects to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-        return conn
-    except Exception as e:
-        console.print(f"[bold red]❌ Database connection error:[/bold red] {e}")
-        logging.error(f"Database connection error: {e}", exc_info=True)
-        return None
-
-
+@handle_exceptions
 def fetch_stock_metadata(ticker, max_retries=3):
     """Fetches comprehensive stock metadata from Yahoo Finance with retries."""
     for attempt in range(max_retries):
         try:
             stock = yf.Ticker(ticker)
             info = stock.info
-
             return {
                 "ticker": ticker,
                 "company_name": info.get("longName", "Unknown"),
@@ -88,110 +53,72 @@ def fetch_stock_metadata(ticker, max_retries=3):
                 "beta": info.get("beta"),
                 "dividend_yield": info.get("dividendYield"),
             }
-
         except Exception as e:
-            logging.warning(
+            logger.warning(
                 f"⚠ Retry {attempt + 1}/{max_retries} - Failed to fetch data for {ticker}: {e}"
             )
             time.sleep(2**attempt)  # Exponential backoff
-
-    logging.error(f"❌ Max retries reached. Skipping {ticker}.")
-    return {
-        key: None
-        for key in [
-            "ticker",
-            "company_name",
-            "sector",
-            "industry",
-            "exchange",
-            "market_cap",
-            "pe_ratio",
-            "eps",
-            "earnings_date",
-            "ipo_date",
-            "price_to_sales_ratio",
-            "price_to_book_ratio",
-            "enterprise_value",
-            "ebitda",
-            "profit_margin",
-            "return_on_equity",
-            "beta",
-            "dividend_yield",
-        ]
-    }
+    logger.error(f"❌ Max retries reached. Skipping {ticker}.")
+    return {key: None for key in fetch_stock_metadata("placeholder").keys()}
 
 
+@handle_exceptions
 def populate_stock_info():
     """Fetches stock metadata and populates the stock_info table efficiently."""
-    conn = connect_db()
-    if not conn:
-        return
-    cursor = conn.cursor()
+    engine = get_database_engine()
 
-    # ✅ Fetch all tickers from the stocks table
-    cursor.execute("SELECT DISTINCT ticker FROM stocks;")
-    tickers = [row[0] for row in cursor.fetchall()]
+    with engine.connect() as conn:
+        tickers = [
+            row[0] for row in conn.execute(text("SELECT DISTINCT ticker FROM stocks;"))
+        ]
 
     console.print(
         f"\n🚀 Fetching and populating stock metadata for {len(tickers)} stocks...\n",
         style="bold cyan",
     )
 
-    try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue] Processing {task.fields[ticker]}..."),
-            BarColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("", total=len(tickers), ticker="Starting...")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue] Processing {task.fields[ticker]}..."),
+        BarColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("", total=len(tickers), ticker="Starting...")
+        batch_data = []
+        batch_size = 10  # ✅ Efficient batch insert size
 
-            batch_data = []
-            batch_size = 10  # ✅ Efficient batch insert size
-
+        with engine.begin() as conn:
             for ticker in tickers:
-                progress.update(
-                    task, ticker=ticker
-                )  # ✅ Update progress bar with ticker
-
+                progress.update(task, ticker=ticker)
                 metadata = fetch_stock_metadata(ticker)
                 batch_data.append(metadata)
 
-                # ✅ Batch insert when batch size is met
                 if len(batch_data) >= batch_size:
-                    insert_stock_info(cursor, batch_data)
-                    conn.commit()
-                    batch_data.clear()  # ✅ Reset batch
-
+                    insert_stock_info(conn, batch_data)
+                    batch_data.clear()
                 progress.advance(task)
 
-            # ✅ Insert remaining records
             if batch_data:
-                insert_stock_info(cursor, batch_data)
-                conn.commit()
+                insert_stock_info(conn, batch_data)
 
-    except KeyboardInterrupt:
-        handle_exit(cursor, conn)
-
-    finally:
-        cursor.close()
-        conn.close()
-        console.print(
-            "\n[bold green]✅ Stock metadata populated successfully![/bold green]\n"
-        )
+    console.print(
+        "\n[bold green]✅ Stock metadata populated successfully![/bold green]\n"
+    )
 
 
-def insert_stock_info(cursor, batch_data):
+@handle_exceptions
+def insert_stock_info(conn, batch_data):
     """Performs batch insertion of stock metadata into PostgreSQL."""
-    sql = """
+    sql = text(
+        """
         INSERT INTO stock_info (ticker, company_name, sector, industry, exchange, market_cap, pe_ratio, eps, 
                                 earnings_date, ipo_date, price_to_sales_ratio, price_to_book_ratio, enterprise_value, 
                                 ebitda, profit_margin, return_on_equity, beta, dividend_yield)
-        VALUES (%(ticker)s, %(company_name)s, %(sector)s, %(industry)s, %(exchange)s, %(market_cap)s, %(pe_ratio)s, %(eps)s, 
-                %(earnings_date)s, %(ipo_date)s, %(price_to_sales_ratio)s, %(price_to_book_ratio)s, %(enterprise_value)s, 
-                %(ebitda)s, %(profit_margin)s, %(return_on_equity)s, %(beta)s, %(dividend_yield)s)
+        VALUES (:ticker, :company_name, :sector, :industry, :exchange, :market_cap, :pe_ratio, :eps, 
+                :earnings_date, :ipo_date, :price_to_sales_ratio, :price_to_book_ratio, :enterprise_value, 
+                :ebitda, :profit_margin, :return_on_equity, :beta, :dividend_yield)
         ON CONFLICT (ticker) DO UPDATE
         SET company_name = EXCLUDED.company_name,
             sector = EXCLUDED.sector,
@@ -211,31 +138,9 @@ def insert_stock_info(cursor, batch_data):
             beta = EXCLUDED.beta,
             dividend_yield = EXCLUDED.dividend_yield;
     """
-
-    try:
-        cursor.executemany(sql, batch_data)
-        logging.info(f"✅ Batch inserted {len(batch_data)} records into stock_info.")
-    except Exception as e:
-        logging.error(f"❌ Failed batch insert: {e}", exc_info=True)
-
-
-# ✅ Graceful Exit Handler
-def handle_exit(cursor=None, conn=None):
-    """Handles graceful shutdown for SIGINT/SIGTERM signals."""
-    console.print("\n[bold red]⚠ Process interrupted! Exiting gracefully...[/bold red]")
-    logging.info("Process interrupted. Exiting gracefully...")
-
-    if cursor:
-        cursor.close()
-    if conn:
-        conn.close()
-
-    sys.exit(0)
-
-
-# ✅ Register signal handlers for clean exit
-signal.signal(signal.SIGINT, lambda signum, frame: handle_exit())
-signal.signal(signal.SIGTERM, lambda signum, frame: handle_exit())
+    )
+    conn.execute(sql, batch_data)
+    logger.info(f"✅ Batch inserted {len(batch_data)} records into stock_info.")
 
 
 if __name__ == "__main__":

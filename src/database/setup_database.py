@@ -3,57 +3,27 @@ import os
 import signal
 import sys
 
-import psycopg2
-from dotenv import load_dotenv
 from rich.console import Console
+from sqlalchemy import text
 
-# ✅ Load environment variables
-load_dotenv()
+# ✅ Import utilities
+from src.tools.utils import get_database_engine, handle_exceptions, setup_logging
 
 # ✅ Setup Logging
 LOG_FILE = "data/logs/database_setup.log"
-os.makedirs("data/logs", exist_ok=True)
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+setup_logging(LOG_FILE)
+logger = logging.getLogger(__name__)
 console = Console()
-
-# ✅ Database Configuration
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
+logger.info("🚀 Logging setup complete.")
 
 
-def connect_db():
-    """Connects to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        console.print(f"[bold red]❌ Database connection error:[/bold red] {e}")
-        logging.error(f"Database connection error: {e}", exc_info=True)
-        return None
-
-
-def update_stock_info_table(cursor):
+@handle_exceptions
+def update_stock_info_table(engine):
     """Ensures `stock_info` table has all required columns."""
     console.print(
         "[bold yellow]🔄 Checking and updating `stock_info` table...[/bold yellow]"
     )
-
     required_columns = {
         "ticker": "VARCHAR(10) PRIMARY KEY",
         "company_name": "TEXT",
@@ -75,41 +45,48 @@ def update_stock_info_table(cursor):
         "dividend_yield": "NUMERIC",
     }
 
-    # ✅ Fetch existing columns
-    cursor.execute(
-        "SELECT column_name FROM information_schema.columns WHERE table_name = 'stock_info';"
-    )
-    existing_columns = {row[0] for row in cursor.fetchall()}
+    with engine.connect() as conn:
+        existing_columns = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = 'stock_info';"
+                )
+            )
+        }
 
-    # ✅ Add missing columns
-    for column, column_type in required_columns.items():
-        if column not in existing_columns:
-            cursor.execute(f"ALTER TABLE stock_info ADD COLUMN {column} {column_type};")
-            console.print(f"[bold green]➕ Added column:[/bold green] {column}")
+        for column, column_type in required_columns.items():
+            if column not in existing_columns:
+                conn.execute(
+                    text(f"ALTER TABLE stock_info ADD COLUMN {column} {column_type};")
+                )
+                console.print(f"[bold green]➕ Added column:[/bold green] {column}")
 
-    # ✅ Remove outdated columns
-    for column in existing_columns:
-        if column not in required_columns:
-            cursor.execute(f"ALTER TABLE stock_info DROP COLUMN {column} CASCADE;")
-            console.print(f"[bold red]❌ Removed outdated column:[/bold red] {column}")
+        for column in existing_columns:
+            if column not in required_columns:
+                conn.execute(
+                    text(f"ALTER TABLE stock_info DROP COLUMN {column} CASCADE;")
+                )
+                console.print(
+                    f"[bold red]❌ Removed outdated column:[/bold red] {column}"
+                )
 
     console.print(
         "[bold green]✅ `stock_info` table updated successfully![/bold green]"
     )
-    logging.info("Updated `stock_info` table with latest schema.")
+    logger.info("Updated `stock_info` table with latest schema.")
 
 
+@handle_exceptions
 def create_tables():
     """Creates all necessary tables in the PostgreSQL database."""
-    conn = connect_db()
-    if not conn:
-        return
+    engine = get_database_engine()
 
-    with conn.cursor() as cur:
+    with engine.connect() as conn:
         try:
-            # ✅ Create `stocks` table
-            cur.execute(
-                """
+            conn.execute(
+                text(
+                    """
                 CREATE TABLE IF NOT EXISTS stocks (
                     id SERIAL PRIMARY KEY,
                     ticker VARCHAR(10) NOT NULL,
@@ -123,11 +100,12 @@ def create_tables():
                     UNIQUE (ticker, date)
                 );
             """
+                )
             )
 
-            # ✅ Create `stock_info` table (stores metadata like sector, fundamentals)
-            cur.execute(
-                """
+            conn.execute(
+                text(
+                    """
                 CREATE TABLE IF NOT EXISTS stock_info (
                     ticker VARCHAR(10) PRIMARY KEY,
                     company_name TEXT,
@@ -149,11 +127,12 @@ def create_tables():
                     dividend_yield NUMERIC
                 );
             """
+                )
             )
 
-            # ✅ Create `news_sentiment` table
-            cur.execute(
-                """
+            conn.execute(
+                text(
+                    """
                 CREATE TABLE IF NOT EXISTS news_sentiment (
                     id SERIAL PRIMARY KEY,
                     ticker VARCHAR(10) NOT NULL,
@@ -166,11 +145,12 @@ def create_tables():
                     created_at TIMESTAMP DEFAULT NOW()
                 );
             """
+                )
             )
 
-            # ✅ Create `technical_indicators` table
-            cur.execute(
-                """
+            conn.execute(
+                text(
+                    """
                 CREATE TABLE IF NOT EXISTS technical_indicators (
                     id SERIAL PRIMARY KEY,
                     ticker VARCHAR(10) NOT NULL,
@@ -196,33 +176,21 @@ def create_tables():
                     UNIQUE (ticker, date)
                 );
             """
+                )
             )
 
-            update_stock_info_table(cur)
-
+            update_stock_info_table(engine)
             console.print(
                 "[bold green]✅ Database tables created successfully![/bold green]"
             )
-            logging.info("Database tables created successfully.")
-
+            logger.info("Database tables created successfully.")
         except Exception as e:
             console.print(f"[bold red]❌ Error creating tables:[/bold red] {e}")
-            logging.error(f"Error creating tables: {e}", exc_info=True)
-
-    conn.close()
+            logger.error(f"Error creating tables: {e}", exc_info=True)
 
 
-# ✅ Graceful Exit Handler
-def handle_exit(signum, frame):
-    console.print("\n[bold red]⚠ Process interrupted! Exiting gracefully...[/bold red]")
-    logging.info("Process interrupted. Exiting gracefully...")
-    sys.exit(0)
-
-
-# ✅ Register signal handlers for clean exit
-signal.signal(signal.SIGINT, handle_exit)  # Handle Ctrl+C
-signal.signal(signal.SIGTERM, handle_exit)  # Handle termination signals
-
+signal.signal(signal.SIGINT, lambda signum, frame: sys.exit(0))
+signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
 
 if __name__ == "__main__":
     create_tables()

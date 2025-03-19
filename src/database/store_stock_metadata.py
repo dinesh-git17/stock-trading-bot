@@ -1,78 +1,51 @@
 import logging
 import os
 
-import psycopg2
 import yfinance as yf
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from sqlalchemy import text
 
-# Load environment variables
-load_dotenv()
+# ✅ Import utilities
+from src.tools.utils import get_database_engine, handle_exceptions, setup_logging
 
-# Setup logging
-logging.basicConfig(
-    filename="data/logs/stock_metadata.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
+# ✅ Setup Logging
+LOG_FILE = "data/logs/stock_metadata.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+setup_logging(LOG_FILE)
+logger = logging.getLogger(__name__)
 console = Console()
-
-# Database Configuration
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
+logger.info("🚀 Logging setup complete.")
 
 
-def connect_db():
-    """Connects to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-        return conn
-    except Exception as e:
-        console.print(f"[bold red]❌ Database connection error:[/bold red] {e}")
-        logging.error(f"Database connection error: {e}")
-        return None
-
-
+@handle_exceptions
 def fetch_stock_metadata(ticker):
     """Fetches market cap, P/E ratio, earnings date, and financial metrics from Yahoo Finance."""
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
-
         return {
             "company_name": info.get("longName", "Unknown"),
             "sector": info.get("sector", "Unknown"),
-            "market_cap": info.get("marketCap", None),
-            "pe_ratio": info.get("trailingPE", None),
-            "eps": info.get("trailingEps", None),
-            "earnings_date": info.get("nextEarningsDate", None),
+            "market_cap": info.get("marketCap"),
+            "pe_ratio": info.get("trailingPE"),
+            "eps": info.get("trailingEps"),
+            "earnings_date": info.get("nextEarningsDate"),
         }
     except Exception as e:
-        logging.warning(f"Failed to fetch metadata for {ticker}: {e}")
+        logger.warning(f"Failed to fetch metadata for {ticker}: {e}")
         return None
 
 
+@handle_exceptions
 def store_stock_metadata():
     """Fetches and updates stock metadata in the `stock_info` table."""
-    conn = connect_db()
-    if not conn:
-        return
-    cursor = conn.cursor()
+    engine = get_database_engine()
 
-    # Fetch all tickers from the `stocks` table
-    cursor.execute("SELECT DISTINCT ticker FROM stocks;")
-    tickers = [row[0] for row in cursor.fetchall()]
+    with engine.connect() as conn:
+        tickers = [
+            row[0] for row in conn.execute(text("SELECT DISTINCT ticker FROM stocks;"))
+        ]
 
     with Progress(
         SpinnerColumn(),
@@ -81,43 +54,34 @@ def store_stock_metadata():
     ) as progress:
         task = progress.add_task("metadata", total=len(tickers))
 
-        for ticker in tickers:
-            metadata = fetch_stock_metadata(ticker)
-            if metadata:
-                try:
-                    cursor.execute(
-                        """
-                        INSERT INTO stock_info (ticker, company_name, sector, market_cap, pe_ratio, eps, earnings_date)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (ticker) DO UPDATE
-                        SET company_name = EXCLUDED.company_name,
-                            sector = EXCLUDED.sector,
-                            market_cap = EXCLUDED.market_cap,
-                            pe_ratio = EXCLUDED.pe_ratio,
-                            eps = EXCLUDED.eps,
-                            earnings_date = EXCLUDED.earnings_date;
-                        """,
-                        (
-                            ticker,
-                            metadata["company_name"],
-                            metadata["sector"],
-                            metadata["market_cap"],
-                            metadata["pe_ratio"],
-                            metadata["eps"],
-                            metadata["earnings_date"],
-                        ),
-                    )
-                    conn.commit()
-                    logging.info(f"Updated stock metadata for {ticker}")
+        with engine.begin() as conn:
+            for ticker in tickers:
+                metadata = fetch_stock_metadata(ticker)
+                if metadata:
+                    try:
+                        conn.execute(
+                            text(
+                                """
+                                INSERT INTO stock_info (ticker, company_name, sector, market_cap, pe_ratio, eps, earnings_date)
+                                VALUES (:ticker, :company_name, :sector, :market_cap, :pe_ratio, :eps, :earnings_date)
+                                ON CONFLICT (ticker) DO UPDATE
+                                SET company_name = EXCLUDED.company_name,
+                                    sector = EXCLUDED.sector,
+                                    market_cap = EXCLUDED.market_cap,
+                                    pe_ratio = EXCLUDED.pe_ratio,
+                                    eps = EXCLUDED.eps,
+                                    earnings_date = EXCLUDED.earnings_date;
+                                """
+                            ),
+                            metadata | {"ticker": ticker},
+                        )
+                        logger.info(f"Updated stock metadata for {ticker}")
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to update stock metadata for {ticker}: {e}"
+                        )
+                progress.update(task, advance=1)
 
-                except Exception as e:
-                    logging.error(f"Failed to update stock metadata for {ticker}: {e}")
-                    conn.rollback()
-
-            progress.update(task, advance=1)
-
-    cursor.close()
-    conn.close()
     console.print("[bold green]✅ Stock metadata updated successfully![/bold green]")
 
 

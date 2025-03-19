@@ -61,66 +61,39 @@ def compute_technical_indicators(ticker):
     if df is None:
         return
 
-    indicators = {
-        "SMA_50": ta.sma(df["close"], length=50),
-        "SMA_200": ta.sma(df["close"], length=200),
-        "EMA_50": ta.ema(df["close"], length=50),
-        "EMA_200": ta.ema(df["close"], length=200),
-        "RSI_14": ta.rsi(df["close"], length=14),
-        "ADX_14": ta.adx(df["high"], df["low"], df["close"], length=14),
-        "ATR_14": ta.atr(df["high"], df["low"], df["close"], length=14),
-        "CCI_20": ta.cci(df["high"], df["low"], df["close"], length=20),
-        "WilliamsR_14": ta.willr(df["high"], df["low"], df["close"], length=14),
-        "MACD": ta.macd(df["close"]),
-        "Bollinger": ta.bbands(df["close"], length=20),
-        "Stochastic": ta.stoch(df["high"], df["low"], df["close"], k=14, d=3),
-    }
-
-    # ✅ Ensure indicators exist before assignment
+    # ✅ Compute Indicators
     df = df.assign(
-        MACD=(
-            indicators["MACD"]["MACD_12_26_9"]
-            if indicators["MACD"] is not None
-            else None
-        ),
-        MACD_Signal=(
-            indicators["MACD"]["MACDs_12_26_9"]
-            if indicators["MACD"] is not None
-            else None
-        ),
-        MACD_Hist=(
-            indicators["MACD"]["MACDh_12_26_9"]
-            if indicators["MACD"] is not None
-            else None
-        ),
-        BB_Upper=(
-            indicators["Bollinger"]["BBU_20_2.0"]
-            if indicators["Bollinger"] is not None
-            else None
-        ),
-        BB_Middle=(
-            indicators["Bollinger"]["BBM_20_2.0"]
-            if indicators["Bollinger"] is not None
-            else None
-        ),
-        BB_Lower=(
-            indicators["Bollinger"]["BBL_20_2.0"]
-            if indicators["Bollinger"] is not None
-            else None
-        ),
-        Stoch_K=(
-            indicators["Stochastic"]["STOCHk_14_3_3"]
-            if indicators["Stochastic"] is not None
-            else None
-        ),
-        Stoch_D=(
-            indicators["Stochastic"]["STOCHd_14_3_3"]
-            if indicators["Stochastic"] is not None
-            else None
-        ),
+        sma_50=ta.sma(df["close"], length=50),
+        sma_200=ta.sma(df["close"], length=200),
+        ema_50=ta.ema(df["close"], length=50),
+        ema_200=ta.ema(df["close"], length=200),
+        rsi_14=ta.rsi(df["close"], length=14),
+        adx_14=ta.adx(df["high"], df["low"], df["close"], length=14)["ADX_14"],
+        atr_14=ta.atr(df["high"], df["low"], df["close"], length=14),
+        cci_20=ta.cci(df["high"], df["low"], df["close"], length=20),
+        williamsr_14=ta.willr(df["high"], df["low"], df["close"], length=14),
     )
 
+    # ✅ Handle MACD, Bollinger Bands, and Stochastic
+    macd = ta.macd(df["close"])
+    bbands = ta.bbands(df["close"], length=20)
+    stoch = ta.stoch(df["high"], df["low"], df["close"], k=14, d=3)
+
+    df = df.assign(
+        macd=macd["MACD_12_26_9"] if macd is not None else None,
+        macd_signal=macd["MACDs_12_26_9"] if macd is not None else None,
+        macd_hist=macd["MACDh_12_26_9"] if macd is not None else None,
+        bb_upper=bbands["BBU_20_2.0"] if bbands is not None else None,
+        bb_middle=bbands["BBM_20_2.0"] if bbands is not None else None,
+        bb_lower=bbands["BBL_20_2.0"] if bbands is not None else None,
+        stoch_k=stoch["STOCHk_14_3_3"] if stoch is not None else None,
+        stoch_d=stoch["STOCHd_14_3_3"] if stoch is not None else None,
+    )
+
+    # ✅ Drop NaN values after indicator calculations
     df.dropna(inplace=True)
+
+    # ✅ Save processed data
     processed_file = os.path.join(PROCESSED_DATA_DIR, f"{ticker}_processed.csv")
     df.to_csv(processed_file)
     logger.info(f"✅ Processed indicators for {ticker} saved to {processed_file}")

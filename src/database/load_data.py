@@ -2,63 +2,33 @@ import logging
 import os
 
 import pandas as pd
-import psycopg2
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from sqlalchemy import text
+
+from src.tools.utils import get_database_engine, handle_exceptions, setup_logging
 
 # ✅ Load environment variables
 load_dotenv()
 
 # ✅ Setup Logging
 LOG_FILE = "data/logs/load_data.log"
-os.makedirs("data/logs", exist_ok=True)
-
-# ✅ Insert 5 blank lines before logging new logs
-with open(LOG_FILE, "a") as log_file:
-    log_file.write("\n" * 5)
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)  # Ensure log directory exists
+setup_logging(LOG_FILE)
+logger = logging.getLogger(__name__)
 console = Console()
-
-# ✅ Database Configuration
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
 
 # ✅ Data Directories
 CLEANED_DATA_DIR = "data/cleaned/"
 
 
-### **🚀 Connect to PostgreSQL Database**
-def connect_db():
-    """Connects to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        console.print(f"[bold red]❌ Database connection error:[/bold red] {e}")
-        logging.error(f"Database connection error: {e}")
-        return None
-
-
-### **🚀 Insert Data into Database**
-def insert_data(cursor, ticker, df):
-    """Inserts cleaned stock data into `stocks` and `technical_indicators` tables."""
+@handle_exceptions
+def insert_data(engine, ticker, df):
+    """
+    Inserts cleaned stock data into `stocks` and `technical_indicators` tables using batch processing.
+    Ensures all required indicator columns exist and fills missing ones with None.
+    """
     try:
         stock_columns = [
             "ticker",
@@ -92,83 +62,131 @@ def insert_data(cursor, ticker, df):
             "stoch_d",
         ]
 
-        # ✅ Ensure required columns exist
-        df["ticker"] = ticker
-        df.rename(columns={"Date": "date"}, inplace=True)
+        df["ticker"] = ticker  # ✅ Ensure ticker column exists
+        df.rename(columns={"Date": "date"}, inplace=True)  # ✅ Standardize column names
 
-        # ✅ Insert into `stocks` table
-        stock_values = df[stock_columns].values.tolist()
-        stock_insert_query = f"""
+        # ✅ Ensure missing indicator columns are filled with None
+        for col in indicator_columns:
+            if col not in df.columns:
+                df[col] = None  # Fill missing columns
+
+        stock_values = df[stock_columns].to_dict(orient="records")
+        indicator_values = df[indicator_columns].to_dict(orient="records")
+
+        stock_query = text(
+            f"""
             INSERT INTO stocks ({", ".join(stock_columns)}) 
-            VALUES ({", ".join(["%s"] * len(stock_columns))})
-            ON CONFLICT (ticker, date) DO NOTHING;
+            VALUES ({", ".join([":%s" % col for col in stock_columns])})
+            ON CONFLICT (ticker, date) DO UPDATE 
+            SET open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
+                close = EXCLUDED.close,
+                volume = EXCLUDED.volume,
+                adjusted_close = EXCLUDED.adjusted_close;
         """
-        cursor.executemany(stock_insert_query, stock_values)
+        )
 
-        # ✅ Insert into `technical_indicators` table
-        indicator_values = df[indicator_columns].values.tolist()
-        indicator_insert_query = f"""
+        indicator_query = text(
+            f"""
             INSERT INTO technical_indicators ({", ".join(indicator_columns)}) 
-            VALUES ({", ".join(["%s"] * len(indicator_columns))})
-            ON CONFLICT (ticker, date) DO NOTHING;
+            VALUES ({", ".join([":%s" % col for col in indicator_columns])})
+            ON CONFLICT (ticker, date) DO UPDATE 
+            SET sma_50 = EXCLUDED.sma_50,
+                sma_200 = EXCLUDED.sma_200,
+                ema_50 = EXCLUDED.ema_50,
+                ema_200 = EXCLUDED.ema_200,
+                rsi_14 = EXCLUDED.rsi_14,
+                adx_14 = EXCLUDED.adx_14,
+                atr_14 = EXCLUDED.atr_14,
+                cci_20 = EXCLUDED.cci_20,
+                williamsr_14 = EXCLUDED.williamsr_14,
+                macd = EXCLUDED.macd,
+                macd_signal = EXCLUDED.macd_signal,
+                macd_hist = EXCLUDED.macd_hist,
+                bb_upper = EXCLUDED.bb_upper,
+                bb_middle = EXCLUDED.bb_middle,
+                bb_lower = EXCLUDED.bb_lower,
+                stoch_k = EXCLUDED.stoch_k,
+                stoch_d = EXCLUDED.stoch_d;
         """
-        cursor.executemany(indicator_insert_query, indicator_values)
+        )
 
-        logging.info(f"✅ Successfully loaded data for {ticker}")
+        with engine.begin() as connection:  # ✅ Ensure the transaction commits properly
+            try:
+                connection.execute(stock_query, stock_values)
+            except Exception as e:
+                logger.error(
+                    f"❌ Error inserting stock data for {ticker}: {e}", exc_info=True
+                )
+
+            try:
+                connection.execute(indicator_query, indicator_values)
+            except Exception as e:
+                logger.error(
+                    f"❌ Error inserting indicator data for {ticker}: {e}",
+                    exc_info=True,
+                )
+
+        logger.info(f"✅ Successfully loaded data for {ticker}")
 
     except Exception as e:
         console.print(f"[bold red]❌ Error inserting data for {ticker}:[/bold red] {e}")
-        logging.error(f"Error inserting data for {ticker}: {e}")
+        logger.error(f"Error inserting data for {ticker}: {e}", exc_info=True)
 
 
-### **🚀 Process a Single Stock**
-def process_stock(ticker, cursor):
-    """Loads cleaned stock data for a given ticker and inserts it into the database."""
+@handle_exceptions
+def process_stock(engine, ticker):
+    """
+    Loads cleaned stock data for a given ticker and inserts it into the database.
+    """
     cleaned_file = os.path.join(CLEANED_DATA_DIR, f"{ticker}_cleaned.csv")
 
     if not os.path.exists(cleaned_file):
-        logging.warning(f"⚠ Cleaned data file missing for {ticker}")
+        logger.warning(f"⚠ Cleaned data file missing for {ticker}")
         return
 
     df = pd.read_csv(cleaned_file, parse_dates=["Date"])
 
     if df.empty:
-        logging.warning(f"⚠ No data found in {cleaned_file}")
+        logger.warning(f"⚠ No data found in {cleaned_file}")
         return
 
-    insert_data(cursor, ticker, df)
+    insert_data(engine, ticker, df)
 
 
-### **🚀 Process All Stocks**
+@handle_exceptions
 def process_all_stocks():
-    """Loads all cleaned stock data into the database."""
-    conn = connect_db()
-    if not conn:
+    """
+    Loads all cleaned stock data into the database.
+    """
+    engine = get_database_engine()
+    if not engine:
         return
 
-    with conn.cursor() as cursor:
-        files = [f for f in os.listdir(CLEANED_DATA_DIR) if f.endswith("_cleaned.csv")]
-        tickers = [file.replace("_cleaned.csv", "") for file in files]
+    files = [f for f in os.listdir(CLEANED_DATA_DIR) if f.endswith("_cleaned.csv")]
+    tickers = [file.replace("_cleaned.csv", "") for file in files]
 
-        console.print(f"\n🚀 Loading cleaned stock data for {len(tickers)} stocks...\n")
+    console.print(
+        f"\n🚀 [bold cyan]Loading cleaned stock data for {len(tickers)} stocks...[/bold cyan]\n"
+    )
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold yellow]Inserting Data into Database...[/bold yellow]"),
-            console=console,
-        ) as progress:
-            task = progress.add_task("loading", total=len(tickers))
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold yellow]Inserting Data into Database...[/bold yellow]"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("loading", total=len(tickers))
 
-            for ticker in tickers:
-                process_stock(ticker, cursor)
-                progress.update(task, advance=1)
+        for ticker in tickers:
+            process_stock(engine, ticker)
+            progress.update(task, advance=1)
 
-    conn.close()
     console.print(
         "[bold green]✅ All cleaned stock data loaded successfully![/bold green]"
     )
+    logger.info("✅ All cleaned stock data loaded successfully!")
 
 
-### **🚀 Run the Script**
 if __name__ == "__main__":
     process_all_stocks()

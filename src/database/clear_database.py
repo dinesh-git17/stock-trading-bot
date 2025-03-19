@@ -1,111 +1,79 @@
 import logging
 import os
 
-import psycopg2
 from dotenv import load_dotenv
 from rich.console import Console
+from sqlalchemy import text
 
-# Load environment variables
+from src.tools.utils import get_database_engine, handle_exceptions, setup_logging
+
+# ✅ Load environment variables
 load_dotenv()
 
-# Setup logging
-logging.basicConfig(
-    filename="data/logs/database_clear.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+# ✅ Setup Logging
+LOG_FILE = "data/logs/database_clear.log"
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+setup_logging(LOG_FILE)
+logger = logging.getLogger(__name__)
 
+# ✅ Setup Console
 console = Console()
 
-# Database Configuration
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
 
-
-def connect_db():
-    """Connect to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            dbname=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        console.print(f"[bold red]❌ Database connection error:[/bold red] {e}")
-        logging.error(f"Database connection error: {e}")
-        return None
-
-
-def drop_all_views(cursor):
+@handle_exceptions
+def drop_views(engine):
     """Drops all views from the database."""
-    try:
-        console.print("[bold yellow]⚠️ Dropping all views...[/bold yellow]")
-        cursor.execute(
-            """
-            DO $$ 
-            DECLARE 
-                r RECORD;
-            BEGIN 
-                FOR r IN (SELECT table_name FROM information_schema.views WHERE table_schema = 'public') LOOP 
-                    EXECUTE 'DROP VIEW IF EXISTS ' || quote_ident(r.table_name) || ' CASCADE'; 
-                END LOOP; 
-            END $$;
-            """
-        )
-        console.print(
-            "[bold green]✅ All views have been dropped successfully![/bold green]"
-        )
-        logging.info("All views dropped successfully.")
+    query = text(
+        """
+        DO $$ 
+        DECLARE 
+            r RECORD;
+        BEGIN 
+            FOR r IN (SELECT table_name FROM information_schema.views WHERE table_schema = 'public') LOOP 
+                EXECUTE 'DROP VIEW IF EXISTS ' || quote_ident(r.table_name) || ' CASCADE'; 
+            END LOOP; 
+        END $$;
+    """
+    )
 
-    except Exception as e:
-        console.print(f"[bold red]❌ Error dropping views:[/bold red] {e}")
-        logging.error(f"Error dropping views: {e}")
+    with engine.begin() as connection:
+        connection.execute(query)
+
+    console.print("[bold green]✅ All views dropped successfully![/bold green]")
+    logger.info("All views dropped successfully.")
 
 
-def drop_all_tables(cursor):
+@handle_exceptions
+def drop_tables(engine):
     """Drops all tables from the database."""
-    try:
-        console.print("[bold yellow]⚠️ Dropping all tables...[/bold yellow]")
-        cursor.execute(
-            """
-            DO $$ 
-            DECLARE 
-                r RECORD;
-            BEGIN 
-                FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP 
-                    EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; 
-                END LOOP; 
-            END $$;
-            """
-        )
-        console.print(
-            "[bold green]✅ All tables have been dropped successfully![/bold green]"
-        )
-        logging.info("All tables dropped successfully.")
+    query = text(
+        """
+        DO $$ 
+        DECLARE 
+            r RECORD;
+        BEGIN 
+            FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP 
+                EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE'; 
+            END LOOP; 
+        END $$;
+    """
+    )
 
-    except Exception as e:
-        console.print(f"[bold red]❌ Error dropping tables:[/bold red] {e}")
-        logging.error(f"Error dropping tables: {e}")
+    with engine.begin() as connection:
+        connection.execute(query)
+
+    console.print("[bold green]✅ All tables dropped successfully![/bold green]")
+    logger.info("All tables dropped successfully.")
 
 
 def clear_database():
     """Drops all views and tables to completely reset the database."""
-    conn = connect_db()
-    if not conn:
+    engine = get_database_engine()
+    if not engine:
         return
 
-    with conn.cursor() as cur:
-        drop_all_views(cur)
-        drop_all_tables(cur)
-
-    conn.close()
+    drop_views(engine)
+    drop_tables(engine)
 
 
 if __name__ == "__main__":
