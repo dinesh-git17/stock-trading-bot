@@ -24,6 +24,7 @@ console = Console()
 def handle_exceptions(func):
     """
     A decorator to catch and display unexpected errors in a thick-box styled error panel.
+    It suppresses only error messages (stderr) but allows normal console output (stdout).
 
     Args:
         func (function): The function to wrap.
@@ -33,17 +34,14 @@ def handle_exceptions(func):
     """
 
     def wrapper(*args, **kwargs):
-        # Suppress all stdout and stderr before execution
-        original_stdout = sys.stdout
+        # Suppress only stderr before execution
         original_stderr = sys.stderr
-        sys.stdout = open(os.devnull, "w")
         sys.stderr = open(os.devnull, "w")
 
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            # Restore stdout and stderr before displaying error
-            sys.stdout = original_stdout
+            # Restore stderr before displaying error
             sys.stderr = original_stderr
 
             # Capture detailed traceback information
