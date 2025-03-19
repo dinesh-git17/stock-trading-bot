@@ -5,128 +5,140 @@ import os
 import pandas as pd
 import pandas_ta as ta
 from rich.console import Console
+from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+
+# ✅ Import utilities
+from src.tools.utils import handle_exceptions, setup_logging
 
 # ✅ Setup Logging
 LOG_FILE = "data/logs/technical_indicators.log"
-os.makedirs("data/logs", exist_ok=True)
-
-# ✅ Insert 5 blank lines before logging new logs
-with open(LOG_FILE, "a") as log_file:
-    log_file.write("\n" * 5)
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+setup_logging(LOG_FILE)
+logger = logging.getLogger(__name__)
 console = Console()
+logger.info("🚀 Logging setup complete.")
 
 # ✅ Directories
 RAW_DATA_DIR = "data/raw/"
 PROCESSED_DATA_DIR = "data/processed/"
-os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)  # Ensure processed data directory exists
+os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
 
-# ✅ Max workers for parallel processing
-THREADS = 4  # Adjust based on system resources
-
-# ✅ Required columns for processing
+# ✅ Constants
+THREADS = 4
 REQUIRED_COLUMNS = ["open", "high", "low", "close", "volume", "adjusted_close"]
 
 
-### **🚀 Read and Validate CSV**
+@handle_exceptions
 def read_stock_data(ticker):
     """Reads stock data and ensures it has the necessary structure."""
     raw_file = os.path.join(RAW_DATA_DIR, f"{ticker}.csv")
-
     if not os.path.exists(raw_file):
-        logging.warning(f"⚠ Raw data file missing for {ticker}. Skipping...")
+        logger.warning(f"⚠ Raw data file missing for {ticker}. Skipping...")
         return None
 
     df = pd.read_csv(raw_file)
-
-    # ✅ Ensure proper date parsing
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
-        df.set_index("Date", inplace=True)  # ✅ Use date as index
+        df.set_index("Date", inplace=True)
     else:
-        logging.warning(f"⚠ No valid 'Date' column found in {ticker}.csv. Skipping...")
+        logger.warning(f"⚠ No valid 'Date' column in {ticker}.csv. Skipping...")
         return None
 
-    # ✅ Ensure correct column names (case sensitivity fix)
     df.columns = df.columns.str.lower()
-
-    # ✅ Ensure required columns exist
     if not all(col in df.columns for col in REQUIRED_COLUMNS):
         missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-        logging.warning(
-            f"⚠ Missing columns {missing_cols} in {ticker}.csv. Skipping..."
-        )
+        logger.warning(f"⚠ Missing columns {missing_cols} in {ticker}.csv. Skipping...")
         return None
 
     return df
 
 
-### **🚀 Compute Technical Indicators**
+@handle_exceptions
 def compute_technical_indicators(ticker):
-    """
-    Compute multiple technical indicators for a given stock ticker.
-    Saves processed data into data/processed/.
-    """
+    """Computes technical indicators for a given stock ticker."""
     df = read_stock_data(ticker)
     if df is None:
-        return  # Skip processing if file is invalid
+        return
 
-    # ✅ Compute Technical Indicators
-    df["SMA_50"] = ta.sma(df["close"], length=50)
-    df["SMA_200"] = ta.sma(df["close"], length=200)
-    df["EMA_50"] = ta.ema(df["close"], length=50)
-    df["EMA_200"] = ta.ema(df["close"], length=200)
-    df["RSI_14"] = ta.rsi(df["close"], length=14)
-    df["ADX_14"] = ta.adx(df["high"], df["low"], df["close"], length=14)["ADX_14"]
-    df["ATR_14"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-    df["CCI_20"] = ta.cci(df["high"], df["low"], df["close"], length=20)
-    df["WilliamsR_14"] = ta.willr(df["high"], df["low"], df["close"], length=14)
+    indicators = {
+        "SMA_50": ta.sma(df["close"], length=50),
+        "SMA_200": ta.sma(df["close"], length=200),
+        "EMA_50": ta.ema(df["close"], length=50),
+        "EMA_200": ta.ema(df["close"], length=200),
+        "RSI_14": ta.rsi(df["close"], length=14),
+        "ADX_14": ta.adx(df["high"], df["low"], df["close"], length=14),
+        "ATR_14": ta.atr(df["high"], df["low"], df["close"], length=14),
+        "CCI_20": ta.cci(df["high"], df["low"], df["close"], length=20),
+        "WilliamsR_14": ta.willr(df["high"], df["low"], df["close"], length=14),
+        "MACD": ta.macd(df["close"]),
+        "Bollinger": ta.bbands(df["close"], length=20),
+        "Stochastic": ta.stoch(df["high"], df["low"], df["close"], k=14, d=3),
+    }
 
-    # ✅ Compute MACD & Signal Line
-    macd = ta.macd(df["close"])
-    df["MACD"] = macd["MACD_12_26_9"]
-    df["MACD_Signal"] = macd["MACDs_12_26_9"]
-    df["MACD_Hist"] = macd["MACDh_12_26_9"]
-
-    # ✅ Compute Bollinger Bands
-    bbands = ta.bbands(df["close"], length=20)
-    df["BB_Upper"] = bbands["BBU_20_2.0"]
-    df["BB_Middle"] = bbands["BBM_20_2.0"]
-    df["BB_Lower"] = bbands["BBL_20_2.0"]
-
-    # ✅ Compute Stochastic Oscillator
-    stoch = ta.stoch(df["high"], df["low"], df["close"], k=14, d=3)
-    df["Stoch_K"] = stoch["STOCHk_14_3_3"]
-    df["Stoch_D"] = stoch["STOCHd_14_3_3"]
-
-    # ✅ Drop NaN values after indicator calculations
-    df.dropna(inplace=True)
-
-    # ✅ Save processed data
-    processed_file = os.path.join(PROCESSED_DATA_DIR, f"{ticker}_processed.csv")
-    df.to_csv(processed_file)
-    logging.info(
-        f"✅ Processed technical indicators for {ticker} saved to {processed_file}"
+    # ✅ Ensure indicators exist before assignment
+    df = df.assign(
+        MACD=(
+            indicators["MACD"]["MACD_12_26_9"]
+            if indicators["MACD"] is not None
+            else None
+        ),
+        MACD_Signal=(
+            indicators["MACD"]["MACDs_12_26_9"]
+            if indicators["MACD"] is not None
+            else None
+        ),
+        MACD_Hist=(
+            indicators["MACD"]["MACDh_12_26_9"]
+            if indicators["MACD"] is not None
+            else None
+        ),
+        BB_Upper=(
+            indicators["Bollinger"]["BBU_20_2.0"]
+            if indicators["Bollinger"] is not None
+            else None
+        ),
+        BB_Middle=(
+            indicators["Bollinger"]["BBM_20_2.0"]
+            if indicators["Bollinger"] is not None
+            else None
+        ),
+        BB_Lower=(
+            indicators["Bollinger"]["BBL_20_2.0"]
+            if indicators["Bollinger"] is not None
+            else None
+        ),
+        Stoch_K=(
+            indicators["Stochastic"]["STOCHk_14_3_3"]
+            if indicators["Stochastic"] is not None
+            else None
+        ),
+        Stoch_D=(
+            indicators["Stochastic"]["STOCHd_14_3_3"]
+            if indicators["Stochastic"] is not None
+            else None
+        ),
     )
 
+    df.dropna(inplace=True)
+    processed_file = os.path.join(PROCESSED_DATA_DIR, f"{ticker}_processed.csv")
+    df.to_csv(processed_file)
+    logger.info(f"✅ Processed indicators for {ticker} saved to {processed_file}")
 
-### **🚀 Parallel Processing for All Stocks**
+
+@handle_exceptions
 def process_all_stocks():
-    """
-    Compute technical indicators for all available stock data in data/raw/ using multi-threading.
-    """
-    files = [f for f in os.listdir(RAW_DATA_DIR) if f.endswith(".csv")]
-    tickers = [file.replace(".csv", "") for file in files]
-
+    """Computes technical indicators for all available stock data."""
+    tickers = [
+        file.replace(".csv", "")
+        for file in os.listdir(RAW_DATA_DIR)
+        if file.endswith(".csv")
+    ]
     console.print(
-        f"\n[bold cyan]🚀 Computing technical indicators for {len(tickers)} stocks...[/bold cyan]\n"
+        Panel(
+            f"🚀 Computing technical indicators for {len(tickers)} stocks...",
+            style="bold cyan",
+        )
     )
 
     with Progress(
@@ -136,22 +148,17 @@ def process_all_stocks():
         console=console,
     ) as progress:
         task = progress.add_task("Processing", total=len(tickers))
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
             futures = {
                 executor.submit(compute_technical_indicators, ticker): ticker
                 for ticker in tickers
             }
-
             for future in concurrent.futures.as_completed(futures):
-                future.result()  # Ensure execution completes
+                future.result()
                 progress.update(task, advance=1)
 
-    console.print(
-        f"\n[bold green]✅ Done computing technical indicators![/bold green]\n"
-    )
+    console.print(Panel("✅ Done computing technical indicators!", style="bold green"))
 
 
-### **🚀 Run the Script**
 if __name__ == "__main__":
     process_all_stocks()

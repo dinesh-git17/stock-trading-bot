@@ -4,109 +4,90 @@ import os
 
 import pandas as pd
 from rich.console import Console
+from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from scipy.stats import zscore
 
+# ✅ Import utilities
+from src.tools.utils import handle_exceptions, setup_logging
+
 # ✅ Setup Logging
 LOG_FILE = "data/logs/data_cleaning.log"
-os.makedirs("data/logs", exist_ok=True)
-
-# ✅ Insert 5 blank lines before logging new logs
-with open(LOG_FILE, "a") as log_file:
-    log_file.write("\n" * 5)
-
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+setup_logging(LOG_FILE)
+logger = logging.getLogger(__name__)
 console = Console()
+logger.info("🚀 Logging setup complete.")
 
 # ✅ Directories
 PROCESSED_DATA_DIR = "data/processed/"
 CLEANED_DATA_DIR = "data/cleaned/"
-os.makedirs(CLEANED_DATA_DIR, exist_ok=True)  # Ensure cleaned data directory exists
+os.makedirs(CLEANED_DATA_DIR, exist_ok=True)
 
 # ✅ Parallel processing threads
-THREADS = 4  # Adjust based on system resources
+THREADS = 4
 
 
-### **🚀 Handle Missing Values**
+@handle_exceptions
 def handle_missing_values(df):
-    """
-    Handles missing values using forward fill and interpolation.
-    """
-    df.ffill(inplace=True)  # ✅ Forward fill missing values
-    df.bfill(inplace=True)  # ✅ Backward fill as a second safeguard
-    df.interpolate(method="linear", inplace=True)  # ✅ Linear interpolation
+    """Handles missing values using forward fill, backward fill, and interpolation."""
+    df.ffill(inplace=True)
+    df.bfill(inplace=True)
+    df.interpolate(method="linear", inplace=True)
     return df
 
 
-### **🚀 Remove Outliers**
+@handle_exceptions
 def remove_outliers(df, column="close", threshold=3.0):
-    """
-    Removes outliers using Z-score method while avoiding SettingWithCopyWarning.
-    """
+    """Removes outliers using Z-score method."""
     if column in df.columns:
-        df = df.copy()  # ✅ Ensure we're working on a separate DataFrame
+        df = df.copy()
         df["zscore"] = zscore(df[column].dropna())
-        df = df[df["zscore"].abs() < threshold].copy()  # ✅ Avoid modifying a slice
-        df.drop(columns=["zscore"], inplace=True)  # ✅ Safe drop without warnings
+        df = df[df["zscore"].abs() < threshold].copy()
+        df.drop(columns=["zscore"], inplace=True)
     return df
 
 
-### **🚀 Clean Stock Data**
+@handle_exceptions
 def clean_stock_data(ticker):
-    """
-    Cleans stock data by handling missing values and removing outliers.
-    Saves cleaned data to data/cleaned/.
-    """
+    """Cleans stock data by handling missing values and removing outliers."""
     processed_file = os.path.join(PROCESSED_DATA_DIR, f"{ticker}_processed.csv")
 
     if not os.path.exists(processed_file):
-        logging.warning(f"⚠ Processed data file missing for {ticker}. Skipping...")
+        logger.warning(f"⚠ Processed data file missing for {ticker}. Skipping...")
         return
 
     df = pd.read_csv(processed_file)
-
     if df.empty:
-        logging.warning(f"⚠ No data found in {processed_file}. Skipping...")
+        logger.warning(f"⚠ No data found in {processed_file}. Skipping...")
         return
 
-    # ✅ Ensure correct date parsing
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
-        df.set_index("Date", inplace=True)  # ✅ Use date as index
+        df.set_index("Date", inplace=True)
     else:
-        logging.warning(f"⚠ No valid 'Date' column found in {ticker}. Skipping...")
+        logger.warning(f"⚠ No valid 'Date' column found in {ticker}. Skipping...")
         return
 
-    # ✅ Ensure lowercase column names
     df.columns = df.columns.str.lower()
-
-    # ✅ Handle missing values
     df = handle_missing_values(df)
-
-    # ✅ Remove outliers
     df = remove_outliers(df, column="close")
 
-    # ✅ Save cleaned data
     cleaned_file = os.path.join(CLEANED_DATA_DIR, f"{ticker}_cleaned.csv")
     df.to_csv(cleaned_file)
-    logging.info(f"✅ Saved cleaned data for {ticker} to {cleaned_file}")
+    logger.info(f"✅ Saved cleaned data for {ticker} to {cleaned_file}")
 
 
-### **🚀 Parallel Processing for All Stocks**
+@handle_exceptions
 def process_all_stocks():
-    """
-    Cleans all available stock data in data/processed/ using multi-threading.
-    """
-    files = [f for f in os.listdir(PROCESSED_DATA_DIR) if f.endswith("_processed.csv")]
-    tickers = [file.replace("_processed.csv", "") for file in files]
-
+    """Cleans all available stock data using multi-threading."""
+    tickers = [
+        file.replace("_processed.csv", "")
+        for file in os.listdir(PROCESSED_DATA_DIR)
+        if file.endswith("_processed.csv")
+    ]
     console.print(
-        f"\n[bold cyan]🚀 Cleaning data for {len(tickers)} stocks...[/bold cyan]\n"
+        Panel(f"🚀 Cleaning data for {len(tickers)} stocks...", style="bold cyan")
     )
 
     with Progress(
@@ -116,19 +97,16 @@ def process_all_stocks():
         console=console,
     ) as progress:
         task = progress.add_task("Processing", total=len(tickers))
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
             futures = {
                 executor.submit(clean_stock_data, ticker): ticker for ticker in tickers
             }
-
             for future in concurrent.futures.as_completed(futures):
-                future.result()  # Ensure execution completes
+                future.result()
                 progress.update(task, advance=1)
 
-    console.print(f"\n[bold green]✅ Done cleaning stock data![/bold green]\n")
+    console.print(Panel("✅ Done cleaning stock data!", style="bold green"))
 
 
-### **🚀 Run the Script**
 if __name__ == "__main__":
     process_all_stocks()
