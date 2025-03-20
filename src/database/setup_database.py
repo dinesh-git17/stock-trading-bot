@@ -78,6 +78,65 @@ def update_stock_info_table(engine):
 
 
 @handle_exceptions
+def create_processed_stock_data_table(engine):
+    """Ensures `processed_stock_data` table exists with the correct schema."""
+    console.print(
+        "[bold yellow]🔄 Checking and creating `processed_stock_data` table...[/bold yellow]"
+    )
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS processed_stock_data (
+                    ticker VARCHAR(10) NOT NULL,
+                    date TIMESTAMP NOT NULL,
+                    open DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    close DOUBLE PRECISION,
+                    volume DOUBLE PRECISION,
+                    adjusted_close DOUBLE PRECISION,
+                    sma_50 DOUBLE PRECISION,
+                    sma_200 DOUBLE PRECISION,
+                    ema_50 DOUBLE PRECISION,
+                    ema_200 DOUBLE PRECISION,
+                    rsi_14 DOUBLE PRECISION,
+                    adx_14 DOUBLE PRECISION,
+                    atr_14 DOUBLE PRECISION,
+                    cci_20 DOUBLE PRECISION,
+                    williamsr_14 DOUBLE PRECISION,
+                    macd DOUBLE PRECISION,
+                    macd_signal DOUBLE PRECISION,
+                    macd_hist DOUBLE PRECISION,
+                    bb_upper DOUBLE PRECISION,
+                    bb_lower DOUBLE PRECISION,
+                    stoch_k DOUBLE PRECISION,
+                    stoch_d DOUBLE PRECISION,
+                    sentiment_score DOUBLE PRECISION,
+                    returns DOUBLE PRECISION,
+                    volatility DOUBLE PRECISION,
+                    close_lag_1 DOUBLE PRECISION,
+                    volume_lag_1 DOUBLE PRECISION,
+                    close_lag_5 DOUBLE PRECISION,
+                    volume_lag_5 DOUBLE PRECISION,
+                    close_lag_10 DOUBLE PRECISION,
+                    volume_lag_10 DOUBLE PRECISION,
+                    PRIMARY KEY (ticker, date)
+                );
+                """
+            )
+        )
+
+    console.print(
+        "[bold green]✅ `processed_stock_data` table created successfully with correct data types![/bold green]"
+    )
+    logger.info(
+        "`processed_stock_data` table created successfully with correct data types."
+    )
+
+
+@handle_exceptions
 def create_tables():
     """Creates all necessary tables in the PostgreSQL database."""
     engine = get_database_engine()
@@ -179,6 +238,7 @@ def create_tables():
                 )
             )
 
+            create_processed_stock_data_table(engine)
             update_stock_info_table(engine)
             console.print(
                 "[bold green]✅ Database tables created successfully![/bold green]"
