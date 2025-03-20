@@ -21,31 +21,47 @@ logger.info("🚀 Logging setup complete.")
 @handle_exceptions
 def update_stock_info_table(engine):
     """Ensures `stock_info` table has all required columns."""
+
     console.print(
         "[bold yellow]🔄 Checking and updating `stock_info` table...[/bold yellow]"
     )
-    required_columns = {
-        "ticker": "VARCHAR(10) PRIMARY KEY",
-        "company_name": "TEXT",
-        "sector": "TEXT",
-        "industry": "TEXT",
-        "exchange": "TEXT",
-        "market_cap": "BIGINT",
-        "pe_ratio": "NUMERIC",
-        "eps": "NUMERIC",
-        "earnings_date": "DATE",
-        "ipo_date": "DATE",
-        "price_to_sales_ratio": "NUMERIC",
-        "price_to_book_ratio": "NUMERIC",
-        "enterprise_value": "BIGINT",
-        "ebitda": "BIGINT",
-        "profit_margin": "NUMERIC",
-        "return_on_equity": "NUMERIC",
-        "beta": "NUMERIC",
-        "dividend_yield": "NUMERIC",
-    }
 
+    # ✅ Ensure table exists before modifying it
     with engine.connect() as conn:
+        table_exists = conn.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'stock_info');"
+            )
+        ).scalar()
+
+        if not table_exists:
+            console.print(
+                "[bold red]❌ `stock_info` table does not exist. Skipping update![/bold red]"
+            )
+            logger.error("`stock_info` table does not exist. Skipping update.")
+            return  # ✅ Exit function if table does not exist
+
+        required_columns = {
+            "ticker": "VARCHAR(10) PRIMARY KEY",
+            "company_name": "TEXT",
+            "sector": "TEXT",
+            "industry": "TEXT",
+            "exchange": "TEXT",
+            "market_cap": "BIGINT",
+            "pe_ratio": "NUMERIC",
+            "eps": "NUMERIC",
+            "earnings_date": "DATE",
+            "ipo_date": "DATE",
+            "price_to_sales_ratio": "NUMERIC",
+            "price_to_book_ratio": "NUMERIC",
+            "enterprise_value": "BIGINT",
+            "ebitda": "BIGINT",
+            "profit_margin": "NUMERIC",
+            "return_on_equity": "NUMERIC",
+            "beta": "NUMERIC",
+            "dividend_yield": "NUMERIC",
+        }
+
         existing_columns = {
             row[0]
             for row in conn.execute(
@@ -141,112 +157,119 @@ def create_tables():
     """Creates all necessary tables in the PostgreSQL database."""
     engine = get_database_engine()
 
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         try:
+            # ✅ Ensure `stock_info` is created first
             conn.execute(
                 text(
                     """
-                CREATE TABLE IF NOT EXISTS stocks (
-                    id SERIAL PRIMARY KEY,
-                    ticker VARCHAR(10) NOT NULL,
-                    date TIMESTAMP NOT NULL,
-                    open NUMERIC,
-                    high NUMERIC,
-                    low NUMERIC,
-                    close NUMERIC,
-                    volume BIGINT,
-                    adjusted_close NUMERIC,
-                    UNIQUE (ticker, date)
-                );
-            """
+                    CREATE TABLE IF NOT EXISTS stock_info (
+                        ticker VARCHAR(10) PRIMARY KEY,
+                        company_name TEXT,
+                        sector TEXT,
+                        industry TEXT,
+                        exchange TEXT,
+                        market_cap BIGINT,
+                        pe_ratio NUMERIC,
+                        eps NUMERIC,
+                        earnings_date DATE,
+                        ipo_date DATE,
+                        price_to_sales_ratio NUMERIC,
+                        price_to_book_ratio NUMERIC,
+                        enterprise_value BIGINT,
+                        ebitda BIGINT,
+                        profit_margin NUMERIC,
+                        return_on_equity NUMERIC,
+                        beta NUMERIC,
+                        dividend_yield NUMERIC
+                    );
+                    """
+                )
+            )
+
+            # ✅ Create Other Tables
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS stocks (
+                        id SERIAL PRIMARY KEY,
+                        ticker VARCHAR(10) NOT NULL,
+                        date TIMESTAMP NOT NULL,
+                        open NUMERIC,
+                        high NUMERIC,
+                        low NUMERIC,
+                        close NUMERIC,
+                        volume BIGINT,
+                        adjusted_close NUMERIC,
+                        UNIQUE (ticker, date)
+                    );
+                    """
                 )
             )
 
             conn.execute(
                 text(
                     """
-                CREATE TABLE IF NOT EXISTS stock_info (
-                    ticker VARCHAR(10) PRIMARY KEY,
-                    company_name TEXT,
-                    sector TEXT,
-                    industry TEXT,
-                    exchange TEXT,
-                    market_cap BIGINT,
-                    pe_ratio NUMERIC,
-                    eps NUMERIC,
-                    earnings_date DATE,
-                    ipo_date DATE,
-                    price_to_sales_ratio NUMERIC,
-                    price_to_book_ratio NUMERIC,
-                    enterprise_value BIGINT,
-                    ebitda BIGINT,
-                    profit_margin NUMERIC,
-                    return_on_equity NUMERIC,
-                    beta NUMERIC,
-                    dividend_yield NUMERIC
-                );
-            """
+                    CREATE TABLE IF NOT EXISTS news_sentiment (
+                        id SERIAL PRIMARY KEY,
+                        ticker VARCHAR(10) NOT NULL,
+                        published_at TIMESTAMP NOT NULL,
+                        source_name TEXT,
+                        title TEXT NOT NULL,
+                        description TEXT,
+                        url TEXT NOT NULL UNIQUE,
+                        sentiment_score NUMERIC,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    );
+                    """
                 )
             )
 
             conn.execute(
                 text(
                     """
-                CREATE TABLE IF NOT EXISTS news_sentiment (
-                    id SERIAL PRIMARY KEY,
-                    ticker VARCHAR(10) NOT NULL,
-                    published_at TIMESTAMP NOT NULL,
-                    source_name TEXT,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    url TEXT NOT NULL UNIQUE,
-                    sentiment_score NUMERIC,
-                    created_at TIMESTAMP DEFAULT NOW()
-                );
-            """
-                )
-            )
-
-            conn.execute(
-                text(
+                    CREATE TABLE IF NOT EXISTS technical_indicators (
+                        id SERIAL PRIMARY KEY,
+                        ticker VARCHAR(10) NOT NULL,
+                        date TIMESTAMP NOT NULL,
+                        sma_50 NUMERIC,
+                        sma_200 NUMERIC,
+                        ema_50 NUMERIC,
+                        ema_200 NUMERIC,
+                        rsi_14 NUMERIC,
+                        adx_14 NUMERIC,
+                        atr_14 NUMERIC,
+                        cci_20 NUMERIC,
+                        williamsr_14 NUMERIC,
+                        macd NUMERIC,
+                        macd_signal NUMERIC,
+                        macd_hist NUMERIC,
+                        bb_upper NUMERIC,
+                        bb_middle NUMERIC,
+                        bb_lower NUMERIC,
+                        stoch_k NUMERIC,
+                        stoch_d NUMERIC,
+                        FOREIGN KEY (ticker, date) REFERENCES stocks (ticker, date) ON DELETE CASCADE,
+                        UNIQUE (ticker, date)
+                    );
                     """
-                CREATE TABLE IF NOT EXISTS technical_indicators (
-                    id SERIAL PRIMARY KEY,
-                    ticker VARCHAR(10) NOT NULL,
-                    date TIMESTAMP NOT NULL,
-                    sma_50 NUMERIC,
-                    sma_200 NUMERIC,
-                    ema_50 NUMERIC,
-                    ema_200 NUMERIC,
-                    rsi_14 NUMERIC,
-                    adx_14 NUMERIC,
-                    atr_14 NUMERIC,
-                    cci_20 NUMERIC,
-                    williamsr_14 NUMERIC,
-                    macd NUMERIC,
-                    macd_signal NUMERIC,
-                    macd_hist NUMERIC,
-                    bb_upper NUMERIC,
-                    bb_middle NUMERIC,
-                    bb_lower NUMERIC,
-                    stoch_k NUMERIC,
-                    stoch_d NUMERIC,
-                    FOREIGN KEY (ticker, date) REFERENCES stocks (ticker, date) ON DELETE CASCADE,
-                    UNIQUE (ticker, date)
-                );
-            """
                 )
             )
 
+            # ✅ Ensure `processed_stock_data` is created inside the same transaction
             create_processed_stock_data_table(engine)
-            update_stock_info_table(engine)
+
             console.print(
                 "[bold green]✅ Database tables created successfully![/bold green]"
             )
             logger.info("Database tables created successfully.")
+
         except Exception as e:
             console.print(f"[bold red]❌ Error creating tables:[/bold red] {e}")
             logger.error(f"Error creating tables: {e}", exc_info=True)
+
+    # ✅ Now, update `stock_info` safely outside the transaction block
+    update_stock_info_table(engine)
 
 
 signal.signal(signal.SIGINT, lambda signum, frame: sys.exit(0))
