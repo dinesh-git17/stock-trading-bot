@@ -20,16 +20,16 @@ from rich.table import Table
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import text
-from tensorflow.keras.callbacks import Callback, EarlyStopping
-from tensorflow.keras.layers import (
+from tensorflow.keras.callbacks import Callback, EarlyStopping  # type: ignore
+from tensorflow.keras.layers import (  # type: ignore
     LSTM,
     Dense,
     Input,
     Layer,
     LayerNormalization,
 )
-from tensorflow.keras.optimizers import AdamW
-from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers import AdamW  # type: ignore
+from tensorflow.keras.regularizers import l2  # type: ignore
 
 from src.tools.utils import get_database_engine, handle_exceptions, setup_logging
 
@@ -243,7 +243,7 @@ class LSTMStockPredictor:
         )  # 🔥 More Regularization
         outputs = Dense(1, kernel_regularizer=l2(0.002))(dense_out)
 
-        model = tf.keras.Model(inputs=inputs, outputs=outputs)
+        model = tf.keras.Model(inputs=inputs, outputs=outputs)  # type: ignore
         return model
 
     @handle_exceptions
@@ -266,7 +266,7 @@ class LSTMStockPredictor:
         ) as progress:
             task = progress.add_task("[cyan]Training LSTM...", total=250)
 
-            class ProgressCallback(tf.keras.callbacks.Callback):
+            class ProgressCallback(tf.keras.callbacks.Callback):  # type: ignore
                 def on_epoch_end(self, epoch, logs=None):
                     progress.update(task, advance=1)
 
